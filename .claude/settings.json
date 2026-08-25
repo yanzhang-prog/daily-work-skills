@@ -1,0 +1,172 @@
+{
+  "env": {
+    "BASH_DEFAULT_TIMEOUT_MS": "60000"
+  },
+  "permissions": {
+    "allow": [
+      "Edit(.claude/**)",
+      "Write(.claude/**)",
+      "Bash(uv run *)",
+      "Bash(uv sync *)",
+      "Bash(uv add *)",
+      "Bash(uv lock *)",
+      "Bash(git *)",
+      "Bash(make *)",
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(python3 -c ' *)",
+      "Bash(curl *)",
+      "Edit(evals/**)",
+      "Write(evals/**)",
+      "Edit(tests/**)",
+      "Write(tests/**)",
+      "Edit(src/**)",
+      "Write(src/**)",
+      "WebFetch(domain:centre-for-humanities-computing.github.io)",
+      "Bash(gh api *)",
+      "WebFetch(domain:kennethenevoldsen.github.io)",
+      "WebFetch(domain:kennethenevoldsen.com)",
+      "Bash(xcode-select -p)",
+      "Bash(clang++ --version)",
+      "Bash(.venv/bin/python --version)",
+      "Bash(uv pip *)",
+      "Bash(.venv/bin/python -c \"import dacy; print\\(dacy.__version__\\)\")",
+      "Bash(.venv/bin/python -c \"import dacy; print\\('OK', dacy.__version__\\)\")",
+      "Bash(.venv/bin/python -c \"import dacy; print\\(dir\\(dacy\\)\\)\")",
+      "WebSearch",
+      "Bash(.venv/bin/pip show *)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python -c \"import spacy; nlp = spacy.load\\('da_core_news_lg'\\); print\\('OK:', nlp.meta['name'], 'v' + nlp.meta['version']\\)\")",
+      "Bash(.venv/bin/jupyter nbconvert *)",
+      "Bash(.venv/bin/python -c \"import transformers; print\\(transformers.__file__\\)\")"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.local)",
+      "Read(.env.production)",
+      "Read(*credentials*)",
+      "Write(.env)",
+      "Write(.env.*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/secrets-scan.sh",
+            "timeout": 5,
+            "statusMessage": "Scanning for secrets..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/memory-duplication-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Checking memory for CLAUDE.md duplication..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/structure-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Checking directory structure..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/bash-antipattern.sh",
+            "timeout": 5,
+            "statusMessage": "Checking for bash antipatterns..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/dor-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Checking DoR (plan exists for ticket?)..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/dod-guard.sh",
+            "timeout": 10,
+            "statusMessage": "DoD gate: checking for stubs before push..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/risky-git-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Checking git safety..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/branch-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Checking branch naming..."
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/structure-guard.sh",
+            "timeout": 5,
+            "statusMessage": "Checking directory structure..."
+          },
+          {
+            "type": "command",
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command'); echo \"$cmd\" | grep -qE '^pip install|^pip3 install' && { echo 'Use uv, not pip. Run: uv add <package>' >&2; exit 2; } || exit 0",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command'); echo \"$cmd\" | grep -qE 'rm -rf /|rm -rf ~|DROP TABLE|TRUNCATE TABLE' && { echo 'Blocked: destructive command.' >&2; exit 2; } || exit 0",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command'); echo \"$cmd\" | grep -qE 'git commit' || exit 0; uv run pytest tests/ --tb=short -q 2>&1; rc=$?; [ $rc -eq 0 ] && exit 0; echo 'Tests are failing. Fix before committing.' >&2; exit 2",
+            "timeout": 60,
+            "statusMessage": "Running tests before commit..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.tool_input.file_path // empty'); [[ \"$file\" == *.py ]] && uv run ruff check --fix . 2>&1 | tail -5; exit 0",
+            "timeout": 30,
+            "statusMessage": "Linting..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command // empty'); echo \"$cmd\" | grep -qE 'pytest' || exit 0; osascript -e 'display notification \"Tests finished\" with title \"Claude Code — galactus\"' 2>/dev/null; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"Claude has finished\" with title \"Claude Code — galactus\"' 2>/dev/null; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
