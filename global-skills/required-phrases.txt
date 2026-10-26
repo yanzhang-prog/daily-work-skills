@@ -46,3 +46,25 @@ linear-shape|verifiable outcome
 linear-shape|leaf
 linear-shape|parallel
 linear-shape|recommend
+linear-draft|Expected output
+linear-draft|Out of scope
+linear-draft|Acceptance Criteria
+linear-draft|Value & Justification
+linear-draft|Risks & Dependencies
+linear-draft|Story Point
+linear-draft|proposed
+linear-draft|list_issue_labels
+linear-draft|retired
+linear-draft|never invent
+linear-draft|follow-up question
+linear-draft|blocked: waiting on requester
+linear-draft|unit tests
+linear-draft|[Spike]
+linear-draft|[Eval]
+linear-draft|Epic:
+linear-draft|Figma
+linear-draft|assignee
+linear-draft|cycle
+linear-draft|priority
+linear-draft|resume
+linear-draft|unavailable
