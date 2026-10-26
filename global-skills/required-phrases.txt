@@ -9,3 +9,20 @@ linear-workflow|enter at any phase
 linear-workflow|~/.claude/linear-work
 linear-workflow|does not investigate
 linear-workflow|no handoff file
+linear-investigate|subagent
+linear-investigate|digest
+linear-investigate|never raw
+linear-investigate|red flags
+linear-investigate|not searched
+linear-investigate|duplicate
+linear-investigate|acceptance criteria
+linear-investigate|scope boundary
+linear-investigate|expected output
+linear-investigate|entry A
+linear-investigate|entry B
+linear-investigate|coverage
+linear-investigate|Google Drive
+linear-investigate|Granola
+linear-investigate|prompts.py
+linear-investigate|integrations
+linear-investigate|not searched: no repo
