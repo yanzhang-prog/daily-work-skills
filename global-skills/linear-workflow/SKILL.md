@@ -25,13 +25,14 @@ You can enter at any phase if you already have its input (for example, jump to S
 
 1. Find the handoff file: `~/.claude/linear-work/<YYYY-MM-DD>-<slug>.md`. If the user names a work item, look for its file; otherwise list recent files and ask which one.
 2. **No handoff file:** create one from `references/handoff-template.md`, fill `## Request` and `## Entry` from what the user said, then start at the phase whose input the user already has.
-3. With a file, start at the first section that is empty:
+3. With a file, start at the first section that is empty. A section that still holds only the template's `<filled by ...>` placeholder text counts as empty:
    - no `## Digest` → Investigate
    - Digest but no `## Decision record` → Decide
    - Decision record but no `## Shape` → Shape
    - Shape but no drafts → Draft
    - drafts with `status: approved` → Create
    - drafts marked `blocked: waiting on requester` → resume Draft once the requester's answer is in
+   - mixed approved and blocked drafts → go to Create for the approved ones (it asks the user whether to create them now); the blocked ones wait for Draft
 
 ## Entry points (set in `## Entry`)
 

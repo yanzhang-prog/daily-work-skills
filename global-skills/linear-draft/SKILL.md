@@ -7,6 +7,8 @@ description: Use when Linear tickets have been shaped and you need to draft each
 
 Phase 4 of `linear-workflow`. Input: `## Shape` and `## Decision record`. Output: one block per ticket under `## Drafts` in the handoff file (`~/.claude/linear-work/<date>-<slug>.md`). Use the field order in `references/ticket-template.md`.
 
+**Handoff file:** `~/.claude/linear-work/<date>-<slug>.md`. If none exists, create it from `../linear-workflow/references/handoff-template.md` and fill the input sections from what the user supplies. If several exist, list the recent ones and ask which.
+
 ## Rules
 
 - **Never invent** missing content. If a required field is missing, especially acceptance criteria, scope boundary or expected output, set the ticket's `status: blocked: waiting on requester` and draft a **follow-up question** for the requester (for example a Slack message). Show the draft message; the user decides whether to send it. Do not send it yourself.
@@ -26,4 +28,4 @@ Phase 4 of `linear-workflow`. Input: `## Shape` and `## Decision record`. Output
 3. Look up labels and ask the per-ticket questions.
 4. Show all drafts together, with the proposed estimates and any inferred items called out.
 5. To **resume** after the requester answers (possibly in a new session): read the handoff file, find tickets marked `blocked: waiting on requester`, fill the answers, set `status: draft`, and show them again.
-6. When the user approves, set `status: approved`. Next phase: `linear-create`.
+6. When the user approves, set `status: approved` on each ticket that is not blocked. Approval never changes a blocked ticket's status: it stays `blocked: waiting on requester` until the missing answer is filled in. Next phase: `linear-create`.

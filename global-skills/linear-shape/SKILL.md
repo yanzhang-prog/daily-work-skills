@@ -7,6 +7,8 @@ description: Use when the approach for Linear work is decided and you need to ch
 
 Phase 3 of `linear-workflow`. Input: `## Decision record`. Output: `## Shape` in the handoff file.
 
+**Handoff file:** `~/.claude/linear-work/<date>-<slug>.md`. If none exists, create it from `../linear-workflow/references/handoff-template.md` and fill the input sections from what the user supplies. If several exist, list the recent ones and ask which.
+
 ## The four shapes
 
 1. **Single ticket**: one Expected output, at most 5 SP, one person.

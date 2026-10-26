@@ -87,3 +87,16 @@ linear-create|not created
 linear-create|unavailable
 linear-create|never fabricate
 linear-create|re-check
+linear-create|blocks: [
+linear-create|If none exists, create it
+linear-create|whether to create the rest now
+linear-create|is the parent of
+linear-decide|If none exists, create it
+linear-decide|no spike proposed because
+linear-decide|want one?
+linear-shape|If none exists, create it
+linear-draft|If none exists, create it
+linear-draft|never changes a blocked ticket
+linear-workflow|placeholder text
+linear-workflow|counts as empty
+linear-workflow|mixed approved and blocked

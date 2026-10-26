@@ -9,6 +9,8 @@ Phase 2 of `linear-workflow`, and the one that runs in the main conversation wit
 
 The main question is **how** to do the work. Whether to do it, and how big, was usually settled by whoever asked; it only comes up here when the red flags say so.
 
+**Handoff file:** `~/.claude/linear-work/<date>-<slug>.md`. If none exists, create it from `../linear-workflow/references/handoff-template.md` and fill the input sections from what the user supplies. If several exist, list the recent ones and ask which.
+
 ## Steps
 
 1. **Read `## Red flags` first.** If it lists a duplicate, a conflict or a priority mismatch, confirm with the user whether to continue, and at what size, before anything else. If it says `none`, say so in one line and move on.
@@ -20,12 +22,12 @@ The main question is **how** to do the work. Whether to do it, and how big, was 
 
 ## Spikes: ask every time
 
-When the approach cannot be settled by discussion and reading, and needs hands-on trying, ask the user every time which they want:
+Before writing the decision record, always state the spike call, whichever way it goes. If no spike seems needed, say "no spike proposed because <reason>; want one?" If the approach cannot be settled by discussion and reading and needs hands-on trying, ask the user which they want:
 
 - an **inline spike**: a quick throwaway check now, result recorded in the decision record, or
 - a **spike ticket**: a `[Spike]` ticket with its own Expected output (a conclusion doc), a time box and 2–3 SP, with the follow-up work created as placeholders blocked by it.
 
-You may add one line of recommendation and the reason (for example "about a day and needs data access, so a ticket"). Never decide for them, and never skip the question.
+You may add one line of recommendation and the reason (for example "about a day and needs data access, so a ticket"). Never decide for them, and never skip the question. Record the user's answer in `Spike:`; never write `Spike: none` without having asked.
 
 ## When done
 
