@@ -68,3 +68,22 @@ linear-draft|cycle
 linear-draft|priority
 linear-draft|resume
 linear-draft|unavailable
+linear-create|explicit approval
+linear-create|one approval
+linear-create|reopen
+linear-create|duplicate
+linear-create|list_issues
+linear-create|save_issue
+linear-create|parentId
+linear-create|blockedBy
+linear-create|parent first
+linear-create|reverse dependency
+linear-create|Backlog
+linear-create|Urgent
+linear-create|placeholder
+linear-create|Provisional: approach pending spike result
+linear-create|summary
+linear-create|not created
+linear-create|unavailable
+linear-create|never fabricate
+linear-create|re-check
