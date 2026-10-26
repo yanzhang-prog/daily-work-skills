@@ -36,3 +36,13 @@ linear-decide|spike ticket
 linear-decide|inline spike
 linear-decide|Decision record
 linear-decide|Not doing
+linear-shape|5 SP
+linear-shape|single ticket
+linear-shape|big ticket
+linear-shape|Epic:
+linear-shape|flat group
+linear-shape|completion condition
+linear-shape|verifiable outcome
+linear-shape|leaf
+linear-shape|parallel
+linear-shape|recommend
