@@ -1,1 +1,11 @@
 linear-workflow|handoff
+linear-workflow|Linear ticket
+linear-workflow|linear-investigate
+linear-workflow|linear-decide
+linear-workflow|linear-shape
+linear-workflow|linear-draft
+linear-workflow|linear-create
+linear-workflow|enter at any phase
+linear-workflow|~/.claude/linear-work
+linear-workflow|does not investigate
+linear-workflow|no handoff file
