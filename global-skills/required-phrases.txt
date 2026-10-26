@@ -1,0 +1,104 @@
+linear-workflow|handoff
+linear-workflow|Linear ticket
+linear-workflow|linear-investigate
+linear-workflow|linear-decide
+linear-workflow|linear-shape
+linear-workflow|linear-draft
+linear-workflow|linear-create
+linear-workflow|enter at any phase
+linear-workflow|~/.claude/linear-work
+linear-workflow|does not investigate
+linear-workflow|no handoff file
+linear-investigate|subagent
+linear-investigate|digest
+linear-investigate|never raw
+linear-investigate|red flags
+linear-investigate|not searched
+linear-investigate|duplicate
+linear-investigate|acceptance criteria
+linear-investigate|scope boundary
+linear-investigate|expected output
+linear-investigate|entry A
+linear-investigate|entry B
+linear-investigate|coverage
+linear-investigate|Google Drive
+linear-investigate|Granola
+linear-investigate|prompts.py
+linear-investigate|integrations
+linear-investigate|not searched: no repo
+linear-decide|red flags
+linear-decide|how
+linear-decide|recommend
+linear-decide|web search
+linear-decide|trade-off
+linear-decide|every time
+linear-decide|spike ticket
+linear-decide|inline spike
+linear-decide|Decision record
+linear-decide|Not doing
+linear-shape|5 SP
+linear-shape|single ticket
+linear-shape|big ticket
+linear-shape|Epic:
+linear-shape|flat group
+linear-shape|completion condition
+linear-shape|verifiable outcome
+linear-shape|leaf
+linear-shape|parallel
+linear-shape|recommend
+linear-draft|Expected output
+linear-draft|Out of scope
+linear-draft|Acceptance Criteria
+linear-draft|Value & Justification
+linear-draft|Risks & Dependencies
+linear-draft|Story Point
+linear-draft|proposed
+linear-draft|list_issue_labels
+linear-draft|retired
+linear-draft|never invent
+linear-draft|follow-up question
+linear-draft|blocked: waiting on requester
+linear-draft|unit tests
+linear-draft|[Spike]
+linear-draft|[Eval]
+linear-draft|Epic:
+linear-draft|Figma
+linear-draft|assignee
+linear-draft|cycle
+linear-draft|priority
+linear-draft|resume
+linear-draft|unavailable
+linear-create|explicit approval
+linear-create|one approval
+linear-create|reopen
+linear-create|duplicate
+linear-create|list_issues
+linear-create|save_issue
+linear-create|parentId
+linear-create|blockedBy
+linear-create|parent first
+linear-create|reverse dependency
+linear-create|Backlog
+linear-create|Urgent
+linear-create|placeholder
+linear-create|Provisional: approach pending spike result
+linear-create|summary
+linear-create|not created
+linear-create|unavailable
+linear-create|never fabricate
+linear-create|re-check
+linear-create|blocks: [
+linear-create|If none exists, create it
+linear-create|whether to create the rest now
+linear-create|is the parent of
+linear-decide|If none exists, create it
+linear-decide|no spike proposed because
+linear-decide|want one?
+linear-shape|If none exists, create it
+linear-draft|If none exists, create it
+linear-draft|never changes a blocked ticket
+linear-workflow|placeholder text
+linear-workflow|counts as empty
+linear-workflow|mixed approved and blocked
+linear-draft|too long
+linear-draft|300 words
