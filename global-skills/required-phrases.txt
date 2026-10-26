@@ -101,4 +101,4 @@ linear-workflow|placeholder text
 linear-workflow|counts as empty
 linear-workflow|mixed approved and blocked
 linear-draft|too long
-linear-draft|200 words
+linear-draft|300 words

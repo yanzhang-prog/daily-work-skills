@@ -1,6 +1,6 @@
 # Ticket template (DoR plus two added fields)
 
-Keep the whole ticket short (about 200 words). Link to detail instead of pasting it.
+Keep the whole ticket short: no essays, about 300 words at most. Link to detail instead of pasting it.
 
 Source of truth for the DoR: Notion page "Definition of Ready (DoR) & Definition of Done (DoD)". Field order below.
 
