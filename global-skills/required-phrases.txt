@@ -26,3 +26,13 @@ linear-investigate|Granola
 linear-investigate|prompts.py
 linear-investigate|integrations
 linear-investigate|not searched: no repo
+linear-decide|red flags
+linear-decide|how
+linear-decide|recommend
+linear-decide|web search
+linear-decide|trade-off
+linear-decide|every time
+linear-decide|spike ticket
+linear-decide|inline spike
+linear-decide|Decision record
+linear-decide|Not doing
