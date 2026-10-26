@@ -1,5 +1,7 @@
 # Ticket template (DoR plus two added fields)
 
+Keep the whole ticket short (about 200 words). Link to detail instead of pasting it.
+
 Source of truth for the DoR: Notion page "Definition of Ready (DoR) & Definition of Done (DoD)". Field order below.
 
 **Title**: descriptive and unambiguous. Prefix `[Spike]` for spikes, `[Eval]` for eval work, `Epic:` for epic parents.

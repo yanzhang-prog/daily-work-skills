@@ -127,6 +127,7 @@ Rules:
 - **Missing DoR field blocks per ticket.** A ticket with a gap in a required field is not created. It is marked "blocked, waiting on requester" in the handoff file, together with the drafted follow-up question. The other tickets in the set may be created only if Yan says so. A later session resumes from the handoff file.
 - **Approval.** One approval covers the whole draft set. Any edit after approval, or a new duplicate found by the pre-create re-check, reopens the approval for the affected tickets.
 - **Story points.** Draft proposes an estimate with a one-line reason and marks it "proposed". Yan confirms or changes it when approving. Accepted values follow the team's usage (1, 2, 3, 5); anything above 5 means split.
+- **Ticket length.** Tickets must not be too long: about 200 words total, one to three lines per field, at most five AC bullets, detail linked rather than pasted (added at Yan's request; the 200-word figure is my call).
 - **Figma link.** Asked for only when the work has a UI part. Not applicable to most agent-system tickets.
 - **Other Linear fields.** Team `VIR`, project "Virtual Assistant", state Backlog. **Assignee, cycle and priority are asked per ticket**; the skill proposes nothing silently (Yan's instruction). Never Urgent.
 - **Meeting notes.** Yan's source is Google meeting notes, so search Google Drive and Calendar. Notion's meeting-notes query is also available. Granola needs authorization and is skipped unless authorized.

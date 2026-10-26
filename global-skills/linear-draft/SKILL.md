@@ -12,6 +12,7 @@ Phase 4 of `linear-workflow`. Input: `## Shape` and `## Decision record`. Output
 ## Rules
 
 - **Never invent** missing content. If a required field is missing, especially acceptance criteria, scope boundary or expected output, set the ticket's `status: blocked: waiting on requester` and draft a **follow-up question** for the requester (for example a Slack message). Show the draft message; the user decides whether to send it. Do not send it yourself.
+- **Keep tickets short.** A ticket that is too long does not get read. Aim for about 200 words in total: Context in two or three sentences, Expected output in one or two, at most five Acceptance Criteria bullets, and one line each for Out of scope, Value & Justification and Risks & Dependencies. Link to the Notion page or the handoff file for detail instead of pasting it.
 - **Out of scope** comes from "Not doing" in the decision record. **Expected output** is a delivered thing, **Acceptance Criteria** are the testable conditions. They are different fields.
 - **Acceptance Criteria** state whether unit tests are needed (DoD rule).
 - **Story Point**: propose one of 1, 2, 3, 5 with a one-line reason and mark it *proposed*. The user confirms or changes it at approval. Only leaf tickets get points.
