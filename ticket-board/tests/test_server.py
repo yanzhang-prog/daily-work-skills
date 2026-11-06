@@ -26,9 +26,12 @@ BASE = f"http://127.0.0.1:{config.PORT}"
 class ScriptedSession:
     """Stands in for ClaudeSession. The test thread pushes events with push()."""
 
-    def __init__(self, repo_lines, fail_start=False, send_raises=False, close_raises=False):
+    def __init__(self, repo_lines, fail_start=False, send_raises=False, close_raises=False,
+                 fail_resume=False, dead_on_resume=False):
         self.repo_lines = repo_lines
         self.fail_start = fail_start
+        self.fail_resume = fail_resume
+        self.dead_on_resume = dead_on_resume
         self.send_raises = send_raises
         self.close_raises = close_raises
         self.started = False
@@ -47,8 +50,10 @@ class ScriptedSession:
         self._q = asyncio.Queue()
         if self.fail_start:
             raise RuntimeError("boom token=abc123 /Users/yanzhang/x")
+        if resume is not None and self.fail_resume:
+            raise RuntimeError("No conversation found with session ID")
         self.started = True
-        self.alive = True
+        self.alive = not (resume is not None and self.dead_on_resume)
 
     async def send(self, text):
         if self.send_raises:
@@ -83,11 +88,15 @@ def ok_snap(repo):
 
 class Harness:
     def __init__(self, tmp_path, snapshotter=ok_snap, handoff_reader=lambda p: None,
-                 fail_start=False, history=None, send_raises=False, close_raises=False, **kw):
+                 fail_start=False, history=None, send_raises=False, close_raises=False,
+                 clock=lambda: NOW, poll_seconds=0.05, settings_paths=(), session_kw=None,
+                 session_factory=None, **kw):
         self.tmp = tmp_path
         self.sessions: list[ScriptedSession] = []
         self.snap_calls = []
         self.factory_lines = []
+        self.factory_handoffs = []
+        self.session_kw = dict(session_kw or {})
         self.fail_start = fail_start
         self.loop_thread = None
         self.reader_threads = []
@@ -99,11 +108,16 @@ class Harness:
 
         handoff_reader = reader
 
-        def factory(repo_lines):
+        def factory(repo_lines, handoff_path):
             self.loop_thread = threading.get_ident()  # factory runs on the event-loop thread
             self.factory_lines.append(repo_lines)
-            s = ScriptedSession(repo_lines, fail_start=self.fail_start,
-                                send_raises=send_raises, close_raises=close_raises)
+            self.factory_handoffs.append(handoff_path)
+            if session_factory is not None:
+                s = session_factory(repo_lines, handoff_path)
+            else:
+                s = ScriptedSession(repo_lines, fail_start=self.fail_start,
+                                    send_raises=send_raises, close_raises=close_raises,
+                                    **self.session_kw)
             self.sessions.append(s)
             return s
 
@@ -116,8 +130,9 @@ class Harness:
         self.history_dir = tmp_path / "history"
         self.app = server.create_app(
             registry=self.registry, session_factory=factory, snapshotter=snap,
-            handoff_reader=handoff_reader, clock=lambda: NOW,
-            history_dir=self.history_dir, history=history, poll_seconds=0.05, **kw)
+            handoff_reader=handoff_reader, clock=clock,
+            history_dir=self.history_dir, history=history, poll_seconds=poll_seconds,
+            settings_paths=list(settings_paths), **kw)
 
     def client(self):
         return TestClient(self.app, base_url=BASE)
@@ -754,3 +769,486 @@ def test_close_survives_session_close_failure(tmp_path):
         assert c.delete(f"/api/columns/{col['id']}").status_code == 204
         assert c.get("/api/columns").json() == []
         assert h.registry.get(col["id"]).closed is True
+
+
+# ---------- final fix wave ----------
+from integrations.claude_session import ClaudeSession, SessionIdKnown, handoff_write_rule
+from prompts import COLUMN_RESUME_FALLBACK_PROMPT
+
+
+class HangConnectClient:
+    """SDK client stand-in whose connect() never returns."""
+
+    def __init__(self, options):
+        self.options = options
+
+    async def connect(self):
+        await asyncio.Event().wait()
+
+    async def disconnect(self):
+        pass
+
+
+def hung_claude_factory(repo_lines, handoff_path):
+    return ClaudeSession(repo_lines, client_factory=HangConnectClient,
+                         extra_allowed_tools=[handoff_write_rule(handoff_path)])
+
+
+def history_events(h, cid):
+    return HistoryStore(h.history_dir).read_after(cid)
+
+
+class Clock:
+    def __init__(self):
+        self.now = NOW
+
+    def __call__(self):
+        return self.now
+
+
+def with_watchdog(ws, fn, seconds=3):
+    dog = threading.Timer(seconds, ws.close)  # a missing push must fail the test, not hang it
+    dog.start()
+    try:
+        return fn()
+    finally:
+        dog.cancel()
+
+
+# A1
+def test_a1_hung_connect_becomes_stuck_within_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "START_TIMEOUT_SECONDS", 0.2)
+    h = Harness(tmp_path, session_factory=hung_claude_factory)
+    with h.client() as c:
+        t0 = time.time()
+        col = create(c)
+        assert time.time() - t0 < 3
+        row = status_of(c, col["id"])
+        assert row["status"] == "stuck" and "TimeoutError" in row["note"]
+        assert row["note"] != "starting..."
+
+
+def test_a1_delete_returns_while_start_is_hung(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "START_TIMEOUT_SECONDS", 1.5)
+    monkeypatch.setattr(config, "CLOSE_LOCK_TIMEOUT_SECONDS", 0.1)
+    h = Harness(tmp_path, session_factory=hung_claude_factory)
+    with h.client() as c:
+        t = threading.Thread(target=lambda: c.post("/api/columns", json={"title": "t", "request": "r"}))
+        t.start()
+        try:
+            row = wait_for(lambda: (c.get("/api/columns").json() or [None])[0])
+            wait_for(lambda: h.sessions)  # the hung start is under way
+            t0 = time.time()
+            assert c.delete(f"/api/columns/{row['id']}").status_code == 204
+            assert time.time() - t0 < 1.0  # did not wait for the 1.5 s start timeout
+            assert h.registry.get(row["id"]).closed is True
+        finally:
+            t.join(5)
+        assert not t.is_alive()
+        rt = h.app.board.runtimes[row["id"]]
+        assert rt.session is None and rt.task is None  # nothing left running on a closed column
+        assert c.get("/api/columns").json() == []
+
+
+def test_a1_server_bounds_a_session_start_that_ignores_its_own_timeout(tmp_path, monkeypatch):
+    class Hangs(ScriptedSession):
+        async def start(self, resume=None):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(config, "START_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(server, "START_GRACE_SECONDS", 0.1)
+    h = Harness(tmp_path, session_factory=lambda lines, hp: Hangs(lines))
+    with h.client() as c:
+        col = create(c)
+        row = status_of(c, col["id"])
+        assert row["status"] == "stuck" and "TimeoutError" in row["note"]
+
+
+def test_a1_repo_fetch_is_bounded_while_starting(tmp_path, monkeypatch):
+    gate = threading.Event()
+    monkeypatch.setattr(config, "SNAPSHOT_BUDGET_SECONDS", 0.2)
+    h = Harness(tmp_path, snapshotter=lambda repo: (gate.wait(5), ok_snap(repo))[1])
+    try:
+        with h.client() as c:
+            t0 = time.time()
+            col = create(c)
+            assert time.time() - t0 < 3
+            assert all("not searched" in r and "timed out" in r for r in col["repos_read"])
+            assert h.sessions and h.sessions[0].started  # the session still starts
+            assert status_of(c, col["id"])["note"] != "starting..."
+    finally:
+        gate.set()
+
+
+def test_a1_starting_flag_cannot_stick_when_publish_fails(tmp_path):
+    calls = {"n": 0}
+
+    def reader(p):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk hiccup")
+        return None
+
+    h = Harness(tmp_path, handoff_reader=reader, poll_seconds=100)
+    with h.client() as c:
+        c.post("/api/columns", json={"title": "t", "request": "r"})
+        cid = h.registry.list()[0].id
+        assert h.app.board.runtimes[cid].starting is False
+        assert status_of(c, cid)["note"] != "starting..."
+
+
+# A2
+def test_a2_auth_error_shows_stuck_not_waiting_and_next_message_clears(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s = h.sessions[0]
+        s.push(AssistantText("Invalid API key", NOW))
+        s.push(SessionError("Claude API error: authentication_failed", NOW, fatal=False))
+        s.push(TurnFinished("sid", NOW, is_error=True))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sid")
+        row = status_of(c, col["id"])
+        assert row["status"] == "stuck" and "authentication_failed" in row["note"]
+        assert "waiting for your reply" not in row["note"]
+        types = [e["type"] for e in history_events(h, col["id"])]
+        assert "session_error" in types
+        with wsc(c, f"/ws/columns/{col['id']}") as ws:
+            ws.send_json({"type": "message", "text": "try again"})
+            wait_for(lambda: s.sent[-1:] == ["try again"])
+        row = status_of(c, col["id"])
+        assert row["status"] == "working" and "authentication_failed" not in row["note"]
+
+
+def test_a2_later_clean_turn_clears_recoverable_error(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s = h.sessions[0]
+        s.push(SessionError("turn failed (success, HTTP 429)", NOW, fatal=False))
+        s.push(TurnFinished("sid", NOW, is_error=True))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "stuck")
+        s.push(TurnFinished("sid", NOW, is_error=False))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "needs_you")
+        assert status_of(c, col["id"])["note"] == "waiting for your reply"
+
+
+def test_a2_fatal_error_is_not_cleared_by_a_clean_turn(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s = h.sessions[0]
+        s.push(SessionError("event stream broke", NOW))  # fatal by default
+        s.push(TurnFinished("sid", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sid")
+        assert status_of(c, col["id"])["status"] == "stuck"
+
+
+# A3
+def test_a3_poll_survives_an_exception_and_later_flags_silent_column(tmp_path):
+    clock = Clock()
+    state = {"raise": False, "raised": 0}
+
+    def reader(p):
+        if state["raise"]:
+            state["raise"] = False
+            state["raised"] += 1
+            raise OSError("transient")
+        return None
+
+    h = Harness(tmp_path, handoff_reader=reader, clock=clock)
+    with h.client() as c:
+        col = create(c)
+        with wsc(c, "/ws/board") as board:
+            assert board.receive_json()["columns"][0]["status"] == "working"
+            state["raise"] = True
+            wait_for(lambda: state["raised"] == 1)
+            clock.now = NOW + __import__("datetime").timedelta(seconds=config.STUCK_AFTER_SECONDS + 30)
+            m = with_watchdog(board, lambda: recv_until(board, lambda m: m["columns"][0]["status"] == "stuck"))
+        assert m["columns"][0]["id"] == col["id"] and "no activity" in m["columns"][0]["note"]
+
+
+# A4
+def test_a4_reopen_resume_shows_waiting_for_reply(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        assert status_of(c, col["id"])["status"] == "working"  # create() stays Working
+        h.sessions[0].push(TurnFinished("sess-1", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sess-1")
+        c.delete(f"/api/columns/{col['id']}")
+        r = c.post(f"/api/columns/{col['id']}/reopen").json()
+        assert (r["status"], r["note"]) == ("needs_you", "waiting for your reply")
+
+
+def test_a4_lazy_resume_shows_waiting_for_reply(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        h.sessions[0].push(TurnFinished("sess-9", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sess-9")
+    h2 = Harness(tmp_path)
+    with h2.client() as c2:
+        with wsc(c2, f"/ws/columns/{col['id']}") as ws:
+            m = recv_until(ws, lambda m: m["kind"] == "status" and m["status"]["status"] == "needs_you")
+        assert m["status"]["note"] == "waiting for your reply"
+
+
+def test_a4_create_does_not_set_waiting(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        assert h.app.board.runtimes[col["id"]].waiting_for_reply is False
+
+
+# A5
+def test_a5_activity_of_a_later_turn_clears_waiting(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s = h.sessions[0]
+        s.push(TurnFinished("sid", NOW))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "needs_you")
+        s.push(AssistantText("next turn already running", NOW))  # queued message's turn
+        wait_for(lambda: status_of(c, col["id"])["status"] == "working")
+        s.push(TurnFinished("sid", NOW))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "needs_you")
+        s.push(ToolActivity("Read", "Read file_path=x", NOW))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "working")
+
+
+# B2
+def _closed_with_session_id(c, h, sid="sess-old"):
+    col = create(c)
+    h.sessions[0].push(TurnFinished(sid, NOW))
+    wait_for(lambda: h.registry.get(col["id"]).session_id == sid)
+    c.delete(f"/api/columns/{col['id']}")
+    return col
+
+
+@pytest.mark.parametrize("knob", ["fail_resume", "dead_on_resume"])
+def test_b2_reopen_falls_back_to_fresh_session_from_handoff(tmp_path, knob):
+    h = Harness(tmp_path, session_kw={knob: True})
+    with h.client() as c:
+        col = _closed_with_session_id(c, h)
+        r = c.post(f"/api/columns/{col['id']}/reopen").json()
+        assert len(h.sessions) == 3
+        failed, fresh = h.sessions[1], h.sessions[2]
+        assert failed.resume == "sess-old" and failed.closed
+        assert fresh.resume is None and fresh.started and fresh.alive
+        path = h.registry.get(col["id"]).handoff_path
+        assert fresh.sent == [COLUMN_RESUME_FALLBACK_PROMPT.format(handoff_path=path)]
+        assert str(path) in fresh.sent[0]
+        notes = [e for e in history_events(h, col["id"]) if e["type"] == "system_note"]
+        assert [n["message"] for n in notes] == [
+            "Could not resume the previous session; started a new one from the handoff file."]
+        assert r["status"] == "working"
+
+
+def test_b2_lazy_resume_falls_back_too(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        h.sessions[0].push(TurnFinished("sess-9", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sess-9")
+    h2 = Harness(tmp_path, session_kw={"fail_resume": True})
+    with h2.client() as c2:
+        with wsc(c2, f"/ws/columns/{col['id']}"):
+            wait_for(lambda: len(h2.sessions) == 2 and h2.sessions[1].sent)
+        assert h2.sessions[1].resume is None
+        assert "could not be resumed" in h2.sessions[1].sent[0]
+        assert any(e["type"] == "system_note" for e in history_events(h2, col["id"]))
+
+
+# B3
+def test_b3_session_id_persisted_at_first_event_survives_restart(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        h.sessions[0].push(SessionIdKnown("early-sid", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "early-sid")
+    restarted = ColumnRegistry(tmp_path / "cols.json", handoff_dir=tmp_path / "handoff")
+    assert restarted.get(col["id"]).session_id == "early-sid"
+    assert "turn_finished" not in [e["type"] for e in history_events(h, col["id"])]
+
+
+# B4
+def test_b4_message_to_dead_session_resumes_then_sends(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s0 = h.sessions[0]
+        s0.push(TurnFinished("sess-4", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sess-4")
+        s0.alive = False
+        s0.push(SessionError("RuntimeError: turn failed", NOW))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "stuck")
+        h.app.board.runtimes[col["id"]].primed = True
+        # connect AFTER death would resume lazily; simulate a socket opened before the death
+        rt = h.app.board.runtimes[col["id"]]
+
+        async def go():
+            return await h.app.board.on_message(rt, "are you there?")
+
+        problem = c.portal.call(go)
+        assert problem is None
+        assert len(h.sessions) == 2 and h.sessions[1].resume == "sess-4"
+        assert h.sessions[1].sent == ["are you there?"]
+        assert status_of(c, col["id"])["status"] == "working"
+
+
+# C1 (server side)
+def test_c1_unknown_or_answered_permission_gets_error_frame(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s = h.sessions[0]
+        with wsc(c, f"/ws/columns/{col['id']}") as ws:
+            ws.send_json({"type": "permission", "request_id": "ghost", "allow": True})
+            err = recv_until(ws, lambda m: m["kind"] == "error")
+            assert err["error"] == "permission request no longer pending"
+            s.push(PermissionRequest("r1", "Bash", "Bash command=ls", NOW))
+            recv_until(ws, lambda m: m["kind"] == "event" and m["event"]["type"] == "permission_request")
+            ws.send_json({"type": "permission", "request_id": "r1", "allow": False})
+            recv_until(ws, lambda m: m["kind"] == "event" and m["event"]["type"] == "permission_answer")
+            ws.send_json({"type": "permission", "request_id": "r1", "allow": True})  # second answer
+            err2 = recv_until(ws, lambda m: m["kind"] == "error")
+            assert err2["error"] == "permission request no longer pending"
+        assert s.answers == [("r1", False)]
+        answers = [e for e in history_events(h, col["id"]) if e["type"] == "permission_answer"]
+        assert len(answers) == 1
+
+
+def test_c1_status_messages_carry_pending_ids(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s = h.sessions[0]
+        with wsc(c, f"/ws/columns/{col['id']}") as ws:
+            first = recv_until(ws, lambda m: m["kind"] == "status")
+            assert first["pending"] == []
+            s.push(PermissionRequest("r1", "Bash", "x", NOW))
+            m = recv_until(ws, lambda m: m["kind"] == "status" and m["pending"])
+            assert m["pending"] == ["r1"]
+        with wsc(c, f"/ws/columns/{col['id']}") as ws2:  # replay completion
+            done = recv_until(ws2, lambda m: m["kind"] == "status")
+            assert done["pending"] == ["r1"]
+
+
+# C2
+async def test_c2_retire_during_publish_await_gives_error_not_exception(tmp_path):
+    h = Harness(tmp_path)
+    board = h.app.board
+    col = h.registry.add("t")
+    rt = await board.primed(col)
+    s = ScriptedSession([])
+    await s.start()
+
+    async def retiring_publish(rt_):
+        rt_.session = None  # retire() ran while we were awaiting
+        s.alive = False
+
+    board.publish = retiring_publish
+    rt.session = s
+    assert await board.on_message(rt, "hi") == "session is not running"  # no AttributeError
+    s.alive = True
+    rt.session = s
+    rt.pending["r1"] = "Bash"
+    assert await board.on_permission(rt, "r1", True) == "session is not running"
+    assert s.sent == [] and s.answers == []  # nothing went to a retired session
+
+
+def test_c2_retire_during_message_sends_error_frame(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        board = h.app.board
+        real_publish = board.publish
+
+        async def retiring_publish(rt_):
+            await board.retire(rt_)
+            await real_publish(rt_)
+
+        board.publish = retiring_publish
+        with wsc(c, f"/ws/columns/{col['id']}") as ws:
+            recv_until(ws, lambda m: m["kind"] == "status")
+            ws.send_json({"type": "message", "text": "hello"})
+            err = recv_until(ws, lambda m: m["kind"] == "error")
+        assert err["error"] == "session is not running"
+
+
+# C3
+async def test_c3_safe_close_swallows_disconnect():
+    class WS:
+        def __init__(self, exc):
+            self.exc = exc
+
+        async def close(self, code=1000):
+            raise self.exc
+
+    for exc in (WebSocketDisconnect(1006), RuntimeError("closed"), OSError("gone")):
+        await server._safe_close(WS(exc))  # must not raise
+
+
+def test_c3_endpoints_use_safe_close():
+    import inspect
+    src = inspect.getsource(server.create_app)
+    assert src.count("await _safe_close(ws)") == 2
+    assert "await ws.close()" not in src
+
+
+# D5
+def _bad_settings(tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"permissions": {"allow": ["mcp__claude_ai_Linear__save_issue"]}}))
+    return p
+
+
+def test_d5_server_refuses_to_start_with_unsafe_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "USE_FAKE_SESSIONS", False)
+    h = Harness(tmp_path, settings_paths=[_bad_settings(tmp_path)])
+    with pytest.raises(RuntimeError) as e:
+        with h.client():
+            pass
+    assert "mcp__claude_ai_Linear__save_issue" in str(e.value)
+    c = h.client()  # lifespan never ran: creating a column must still be refused
+    r = c.post("/api/columns", json={"title": "t", "request": "r"})
+    assert r.status_code == 503 and h.sessions == []
+
+
+def test_d5_clean_settings_start_normally(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "USE_FAKE_SESSIONS", False)
+    clean = tmp_path / "clean.json"
+    clean.write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    h = Harness(tmp_path, settings_paths=[clean, tmp_path / "missing.json"])
+    with h.client() as c:
+        create(c)
+
+
+def test_d5_fake_sessions_skip_the_guard(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "USE_FAKE_SESSIONS", True)
+    h = Harness(tmp_path, settings_paths=[_bad_settings(tmp_path)])
+    with h.client() as c:
+        create(c)
+
+
+# R21 wiring: the default factory gives each session exactly its own handoff rule
+def test_r21_default_factory_passes_the_column_handoff_rule(tmp_path, monkeypatch):
+    made = []
+
+    class Recorder(ScriptedSession):
+        def __init__(self, repo_lines, extra_allowed_tools=None):
+            super().__init__(repo_lines)
+            self.extra = extra_allowed_tools
+            made.append(self)
+
+    monkeypatch.setattr(config, "USE_FAKE_SESSIONS", False)
+    monkeypatch.setattr(server, "ClaudeSession", Recorder)
+    reg = ColumnRegistry(tmp_path / "cols.json", handoff_dir=tmp_path / "handoff")
+    app = server.create_app(registry=reg, snapshotter=ok_snap, handoff_reader=lambda p: None,
+                            history_dir=tmp_path / "history", settings_paths=[], poll_seconds=100)
+    with TestClient(app, base_url=BASE) as c:
+        a, b = create(c, title="A"), create(c, title="B")
+    assert [m.extra for m in made] == [
+        [handoff_write_rule(reg.get(a["id"]).handoff_path)],
+        [handoff_write_rule(reg.get(b["id"]).handoff_path)]]
+    assert made[0].extra != made[1].extra

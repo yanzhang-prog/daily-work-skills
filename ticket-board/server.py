@@ -25,12 +25,13 @@ from starlette.websockets import WebSocketDisconnect
 
 import config
 from integrations.claude_session import (
-    AssistantText, ClaudeSession, PermissionRequest, SessionError, ToolActivity, TurnFinished,
-    redact_text,
+    AssistantText, ClaudeSession, PermissionRequest, SessionError, SessionIdKnown, ToolActivity,
+    TurnFinished, handoff_write_rule, redact_text,
 )
 from integrations.fake_session import FakeClaudeSession
 from integrations.git_repos import RepoSnapshot, describe, fetch_and_snapshot
-from prompts import COLUMN_FIRST_MESSAGE_PROMPT
+from integrations.settings_guard import scan_settings
+from prompts import COLUMN_FIRST_MESSAGE_PROMPT, COLUMN_RESUME_FALLBACK_PROMPT
 from states.column_state import Column, ColumnRegistry, SessionFlags, Status, derive_status
 from states.handoff_state import HandoffSummary, read_handoff
 from states.history_state import HistoryStore
@@ -42,6 +43,10 @@ LABELS = {Status.WORKING: "Working", Status.NEEDS_YOU: "Needs you",
           Status.DONE: "Done", Status.STUCK: "Stuck"}
 CLOSE_NOT_FOUND = 4404
 ERROR_LIMIT = 300  # chars of any error text shown to the client or stored
+START_GRACE_SECONDS = 5  # server-side bound on session.start() beyond START_TIMEOUT_SECONDS
+NOT_RUNNING = "session is not running"
+NOT_PENDING = "permission request no longer pending"
+FALLBACK_NOTE = "Could not resume the previous session; started a new one from the handoff file."
 
 
 def assert_local_host(host: str) -> None:
@@ -89,6 +94,7 @@ class Runtime:
     waiting_for_reply: bool = False
     last_event_at: datetime | None = None
     error: str | None = None
+    error_recoverable: bool = False  # set by a non-fatal SessionError; cleared by the next turn
     last_sig: tuple | None = None
     primed: bool = False
     starting: bool = False
@@ -104,6 +110,7 @@ class Board:
         self.runtimes: dict[str, Runtime] = {}
         self.board_subs: set[asyncio.Queue] = set()
         self.poll_task: asyncio.Task | None = None
+        self.guard_ok = False  # set by the app lifespan once the settings guard passed
 
     # ----- status -----
     def runtime(self, col: Column) -> Runtime:
@@ -149,15 +156,21 @@ class Board:
     async def columns_json(self, include_closed: bool = False) -> list[dict]:
         return [await self.column_json(c) for c in self.registry.list(include_closed)]
 
+    @staticmethod
+    def status_msg(rt: Runtime, s: dict) -> dict:
+        """`pending` lets the page tell a live permission request from an expired one."""
+        return {"kind": "status", "status": s, "pending": list(rt.pending)}
+
     async def publish(self, rt: Runtime) -> None:
         """Push status to this column's sockets, and the list to the board, if it changed."""
-        s = await self.status_json(rt)
-        sig = (s["status"], s["note"], s["phase"], tuple(s["completed"]))
+        s = await self.status_json(rt)  # pending is read after this await, below
+        sig = (s["status"], s["note"], s["phase"], tuple(s["completed"]), tuple(rt.pending))
         if sig == rt.last_sig:
             return
         rt.last_sig = sig
+        msg = self.status_msg(rt, s)
         for q in list(rt.subscribers):
-            q.put_nowait({"kind": "status", "status": s})
+            q.put_nowait(msg)
         await self.notify_board()
 
     async def notify_board(self) -> None:
@@ -181,24 +194,43 @@ class Board:
         for q in list(rt.subscribers):
             q.put_nowait({"kind": "event", "event": ev})
 
+    def _set_session_id(self, rt: Runtime, sid: str | None) -> None:
+        if sid and rt.column.session_id != sid:
+            rt.column.session_id = sid
+            self.registry.update(rt.column)
+
+    def _set_error(self, rt: Runtime, message: str, recoverable: bool) -> None:
+        rt.error = redact_text(message, ERROR_LIMIT)
+        rt.error_recoverable = recoverable
+
+    def _clear_recoverable_error(self, rt: Runtime) -> None:
+        if rt.error is not None and rt.error_recoverable:
+            rt.error, rt.error_recoverable = None, False
+
     async def handle_event(self, rt: Runtime, ev) -> None:
         rt.last_event_at = self.clock()
         if isinstance(ev, AssistantText):
+            rt.waiting_for_reply = False  # a later turn (queued message) is running
             self.record(rt, "assistant_text", ev.at, text=ev.text)
         elif isinstance(ev, ToolActivity):
+            rt.waiting_for_reply = False
             self.record(rt, "tool_activity", ev.at, tool=ev.tool, summary=ev.summary)
+        elif isinstance(ev, SessionIdKnown):
+            self._set_session_id(rt, ev.session_id)  # persisted now, not at turn end
         elif isinstance(ev, PermissionRequest):
             rt.pending[ev.request_id] = ev.tool
             self.record(rt, "permission_request", ev.at, request_id=ev.request_id,
                         tool=ev.tool, summary=ev.summary)
         elif isinstance(ev, TurnFinished):
             rt.waiting_for_reply = True
-            if rt.column.session_id != ev.session_id:
-                rt.column.session_id = ev.session_id
-                self.registry.update(rt.column)
+            if not getattr(ev, "is_error", False):
+                self._clear_recoverable_error(rt)
+            self._set_session_id(rt, ev.session_id)
             self.record(rt, "turn_finished", ev.at, session_id=ev.session_id)
         elif isinstance(ev, SessionError):
-            rt.error = redact_text(ev.message, ERROR_LIMIT)
+            # A fatal error is never downgraded by a later recoverable one.
+            recoverable = not getattr(ev, "fatal", True) and (rt.error is None or rt.error_recoverable)
+            self._set_error(rt, ev.message, recoverable)
             self.record(rt, "session_error", ev.at, message=rt.error)
         await self.publish(rt)
 
@@ -219,8 +251,23 @@ class Board:
 
     # ----- sessions -----
     async def snapshots(self) -> list[RepoSnapshot]:
-        return list(await asyncio.gather(
-            *(asyncio.to_thread(self.snapshotter, r) for r in self.repos)))
+        """Fetch all repos in parallel, bounded by SNAPSHOT_BUDGET_SECONDS so a column cannot
+        sit in "starting..." for ever. A repo that misses the budget is "not searched"."""
+        tasks = [asyncio.ensure_future(asyncio.to_thread(self.snapshotter, r)) for r in self.repos]
+        if tasks:
+            await asyncio.wait(tasks, timeout=config.SNAPSHOT_BUDGET_SECONDS)
+        out = []
+        for r, t in zip(self.repos, tasks):
+            if t.done() and not t.cancelled() and t.exception() is None:
+                out.append(t.result())
+                continue
+            if t.done():
+                reason = "not searched: fetch failed"
+            else:
+                t.cancel()  # the git thread itself ends on its own FETCH_TIMEOUT_SECONDS
+                reason = "not searched: fetch timed out"
+            out.append(RepoSnapshot(r.path, None, None, None, reason))
+        return out
 
     @staticmethod
     def repo_line(s: RepoSnapshot) -> str:
@@ -245,16 +292,23 @@ class Board:
     async def launch(self, rt: Runtime, repo_lines: list[str], resume: str | None) -> bool:
         """Create a NEW session (a failed/closed one cannot restart) and start its event pump."""
         await self.retire(rt)
-        session = self.session_factory(repo_lines)
-        rt.session, rt.error = session, None
+        session = self.session_factory(repo_lines, rt.column.handoff_path)
+        rt.session, rt.error, rt.error_recoverable = session, None, False
         rt.waiting_for_reply = False
         rt.last_event_at = self.clock()
-        try:
-            await session.start(resume=resume)
+        try:  # bounded even if a session ignores its own START_TIMEOUT_SECONDS
+            await asyncio.wait_for(session.start(resume=resume),
+                                   config.START_TIMEOUT_SECONDS + START_GRACE_SECONDS)
         except Exception as e:  # noqa: BLE001
             log.warning("session start failed for %s: %s", rt.column.id, type(e).__name__)
-            await self._fail(rt, e)
-            await self.retire(rt)
+            if rt.session is session:
+                await self._fail(rt, e)
+                await self.retire(rt)
+            else:
+                await self._close_quiet(session)
+            return False
+        if rt.session is not session:  # retired while starting (column closed): do not pump
+            await self._close_quiet(session)
             return False
         rt.task = asyncio.create_task(self.pump(rt, session))
         if not session.alive:  # failed start: the error event is queued; close lets it drain
@@ -263,27 +317,41 @@ class Board:
         return True
 
     async def _fail(self, rt: Runtime, e: Exception) -> None:
-        rt.error = redact_text(f"{type(e).__name__}: {e}", ERROR_LIMIT)
+        self._set_error(rt, f"{type(e).__name__}: {e}", recoverable=False)
         self.record(rt, "session_error", self.clock(), message=rt.error)
 
     @asynccontextmanager
     async def starting(self, rt: Runtime):
-        """Show Working "starting..." (not Stuck) while repos fetch and the session starts."""
+        """Show Working "starting..." (not Stuck) while repos fetch and the session starts.
+        Bounded: SNAPSHOT_BUDGET_SECONDS + START_TIMEOUT_SECONDS (+ grace)."""
         rt.starting = True
-        await self.publish(rt)
         try:
+            await self.publish(rt)  # inside the try: a failing publish cannot leave the flag set
             yield
         finally:
             rt.starting = False
+
+    async def _resume(self, rt: Runtime, sid: str) -> None:
+        """Resume `sid`; if that fails, start a fresh session from the handoff file and say so
+        (spec). An idle resumed session is waiting for Yan, not Working. Caller holds rt.lock."""
+        async with self.starting(rt):
+            snaps = await self.snapshots()
+            lines = [self.repo_line(s) for s in snaps]
+            if await self.launch(rt, lines, sid):
+                rt.waiting_for_reply = True  # resumed, no turn running
+                return
+            if rt.column.closed or not await self.launch(rt, lines, None):
+                return
+            self.record(rt, "system_note", self.clock(), message=FALLBACK_NOTE)
+            await rt.session.send(COLUMN_RESUME_FALLBACK_PROMPT.format(
+                handoff_path=rt.column.handoff_path))
 
     async def ensure_session(self, rt: Runtime) -> None:
         """Lazy resume: on first open after a restart (stored session id, no live session)."""
         async with rt.lock:
             sid = rt.column.session_id
             if sid and (rt.session is None or not rt.session.alive) and not rt.column.closed:
-                async with self.starting(rt):
-                    snaps = await self.snapshots()
-                    await self.launch(rt, [self.repo_line(s) for s in snaps], sid)
+                await self._resume(rt, sid)
                 await self.publish(rt)
 
     async def create(self, title: str, request: str) -> Column:
@@ -295,7 +363,8 @@ class Board:
                     snaps = await self.snapshots()
                     col.repos_read = [describe(s) for s in snaps]
                     self.registry.update(col)
-                    if await self.launch(rt, [self.repo_line(s) for s in snaps], None):
+                    if await self.launch(rt, [self.repo_line(s) for s in snaps], None) \
+                            and not col.closed:
                         first = COLUMN_FIRST_MESSAGE_PROMPT.format(
                             request=request, handoff_path=col.handoff_path)
                         self.record(rt, "user_message", self.clock(), message=request)
@@ -304,17 +373,30 @@ class Board:
                 log.warning("create failed for %s: %s", col.id, type(e).__name__)
                 await self._fail(rt, e)
                 await self.retire(rt)
+            if col.closed:  # closed (DELETE) while we were starting
+                await self.retire(rt)
         await self.publish(rt)
         await self.notify_board()
         return col
 
     async def close_column(self, col: Column) -> None:
+        """Never waits for ever: a start that hangs holds rt.lock, so after
+        CLOSE_LOCK_TIMEOUT_SECONDS we close anyway (the starter sees `closed` and retires)."""
         rt = self.runtime(col)
-        async with rt.lock:
-            await self.retire(rt)
+        try:
+            await asyncio.wait_for(rt.lock.acquire(), config.CLOSE_LOCK_TIMEOUT_SECONDS)
+            locked = True
+        except TimeoutError:
+            locked = False
+            log.warning("close of %s proceeding without the column lock", col.id)
+        try:
             self.registry.close(col.id)  # handoff and history files are never touched
+            await self.retire(rt)
             for q in list(rt.subscribers):
                 q.put_nowait(None)
+        finally:
+            if locked:
+                rt.lock.release()
         await self.notify_board()
 
     async def reopen(self, col: Column) -> Column:
@@ -323,9 +405,7 @@ class Board:
         async with rt.lock:
             if rt.session is None or not rt.session.alive:
                 if col.session_id:
-                    async with self.starting(rt):
-                        snaps = await self.snapshots()
-                        await self.launch(rt, [self.repo_line(s) for s in snaps], col.session_id)
+                    await self._resume(rt, col.session_id)
                 else:
                     await self.retire(rt)
                     rt.error = "no session to resume"
@@ -342,30 +422,48 @@ class Board:
 
     # ----- client commands -----
     async def on_message(self, rt: Runtime, text: str) -> str | None:
-        if rt.session is None or not rt.session.alive:
-            return "session is not running"
+        if (rt.session is None or not rt.session.alive) and rt.column.session_id:
+            await self.ensure_session(rt)  # dead after a failed turn: resume (or fall back)
+        session = rt.session  # captured BEFORE any await: retire() may run during publish
+        if session is None or not session.alive:
+            return NOT_RUNNING
         rt.waiting_for_reply = False
+        self._clear_recoverable_error(rt)  # Yan is retrying: show Working again
         rt.last_event_at = self.clock()
         self.record(rt, "user_message", self.clock(), message=text)
         await self.publish(rt)
-        await rt.session.send(text)
+        if rt.session is not session or not session.alive:
+            return NOT_RUNNING  # retired during the await: do not talk to a closed session
+        await session.send(text)
         return None
 
-    async def on_permission(self, rt: Runtime, request_id: str, allow: bool) -> None:
-        tool = rt.pending.pop(request_id, None)
-        if tool is None or rt.session is None:
-            return  # not a request of THIS column's session: ignore
+    async def on_permission(self, rt: Runtime, request_id: str, allow: bool) -> str | None:
+        session = rt.session  # captured before any await
+        if request_id not in rt.pending:
+            return NOT_PENDING  # unknown, already answered, or another column's: nothing recorded
+        if session is None:
+            return NOT_RUNNING
+        tool = rt.pending.pop(request_id)
         self.record(rt, "permission_answer", self.clock(), request_id=request_id,
                     tool=tool, allow=allow)
         await self.publish(rt)
-        await rt.session.answer_permission(request_id, allow)
+        if rt.session is not session:
+            return NOT_RUNNING  # retired meanwhile: its pending requests were denied on close
+        await session.answer_permission(request_id, allow)
+        return None
 
     # ----- polling and shutdown -----
     async def poll(self) -> None:
+        """Never dies on one bad column or one bad read: a dead poll would freeze every status."""
         while True:
             await asyncio.sleep(self.poll_seconds)
             for col in self.registry.list():
-                await self.publish(self.runtime(col))
+                try:
+                    await self.publish(self.runtime(col))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - log the type only, never the text
+                    log.warning("poll failed for %s: %s", col.id, type(e).__name__)
 
     async def shutdown(self) -> None:
         if self.poll_task:
@@ -373,6 +471,14 @@ class Board:
             await asyncio.gather(self.poll_task, return_exceptions=True)
         for rt in list(self.runtimes.values()):
             await self.retire(rt)
+
+
+async def _safe_close(ws: WebSocket) -> None:
+    """Closing a socket the client already left raises (WebSocketDisconnect, RuntimeError...)."""
+    try:
+        await ws.close()
+    except Exception as e:  # noqa: BLE001
+        log.debug("websocket close: %s", type(e).__name__)
 
 
 async def _safe_send(ws: WebSocket, msg: dict) -> bool:
@@ -404,11 +510,12 @@ def create_app(*, registry: ColumnRegistry | None = None, session_factory: Calla
                clock: Callable[[], datetime] | None = None, history_dir: Path | None = None,
                history: HistoryStore | None = None, repos: list | None = None,
                allowed_hosts: set[str] | None = None, allowed_origins: set[str] | None = None,
-               poll_seconds: float | None = None) -> FastAPI:
+               poll_seconds: float | None = None, settings_paths: list | None = None) -> FastAPI:
     if session_factory is None:
-        def session_factory(repo_lines):
+        def session_factory(repo_lines, handoff_path):
             cls = FakeClaudeSession if config.USE_FAKE_SESSIONS else ClaudeSession
-            return cls(repo_lines)
+            extra = [handoff_write_rule(handoff_path)] if handoff_path else []
+            return cls(repo_lines, extra_allowed_tools=extra)  # this column's handoff file only
     names = {config.HOST, "127.0.0.1", "localhost"}
     hosts = allowed_hosts if allowed_hosts is not None else {f"{n}:{config.PORT}" for n in names}
     origins = (allowed_origins if allowed_origins is not None
@@ -421,8 +528,16 @@ def create_app(*, registry: ColumnRegistry | None = None, session_factory: Calla
         history=history or HistoryStore(history_dir), repos=repos if repos is not None else config.REPOS,
         poll_seconds=poll_seconds if poll_seconds is not None else config.HANDOFF_POLL_SECONDS)
 
+    guard_paths = list(settings_paths) if settings_paths is not None else list(config.SETTINGS_FILES)
+
     @asynccontextmanager
     async def lifespan(_app):
+        if not config.USE_FAKE_SESSIONS:
+            problems = await asyncio.to_thread(scan_settings, guard_paths)
+            if problems:
+                raise RuntimeError("refusing to start real sessions; Claude Code settings would "
+                                   "skip the permission gate:\n- " + "\n- ".join(problems))
+        board.guard_ok = True
         board.poll_task = asyncio.create_task(board.poll())
         try:
             yield
@@ -444,6 +559,8 @@ def create_app(*, registry: ColumnRegistry | None = None, session_factory: Calla
 
     @app.post("/api/columns", status_code=201)
     async def create_column(body: NewColumn):
+        if not board.guard_ok:
+            raise HTTPException(503, "settings guard has not passed")
         return await board.column_json(await board.create(body.title, body.request))
 
     @app.delete("/api/columns/{column_id}", status_code=204)
@@ -489,7 +606,8 @@ def create_app(*, registry: ColumnRegistry | None = None, session_factory: Calla
                     last = item["event"]["seq"]
                 return item
 
-            if not await _safe_send(ws, {"kind": "status", "status": await board.status_json(rt)}):
+            status = await board.status_json(rt)
+            if not await _safe_send(ws, board.status_msg(rt, status)):
                 return
             await board.ensure_session(rt)
             await _pump_socket(ws, q, receiver, forward)
@@ -497,10 +615,7 @@ def create_app(*, registry: ColumnRegistry | None = None, session_factory: Calla
             rt.subscribers.discard(q)
             receiver.cancel()
             await asyncio.gather(receiver, return_exceptions=True)
-            try:
-                await ws.close()
-            except RuntimeError:
-                pass
+            await _safe_close(ws)
 
     @app.websocket("/ws/board")
     async def board_ws(ws: WebSocket):
@@ -515,10 +630,7 @@ def create_app(*, registry: ColumnRegistry | None = None, session_factory: Calla
             board.board_subs.discard(q)
             receiver.cancel()
             await asyncio.gather(receiver, return_exceptions=True)
-            try:
-                await ws.close()
-            except RuntimeError:
-                pass
+            await _safe_close(ws)
 
     @app.get("/")
     async def index():
@@ -567,7 +679,9 @@ async def _receive_commands(ws: WebSocket, board: Board, rt: Runtime) -> None:
             if not isinstance(rid, str) or not isinstance(allow, bool):
                 await err("invalid permission answer")
                 continue
-            await board.on_permission(rt, rid, allow)
+            problem = await board.on_permission(rt, rid, allow)
+            if problem:
+                await err(problem)
         else:
             await err("unknown message type")
 
