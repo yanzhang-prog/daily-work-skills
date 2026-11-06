@@ -31,25 +31,38 @@ REPOS: list[RepoConfig] = [
     RepoConfig(Path("/Users/yanzhang/Desktop/virtual-assistant-agent")),
 ]
 
-# Pre-approved (skip the permission prompt): read-only tools and read-only git/gh.
-# Linear write tools are deliberately absent so they reach the permission prompt.
-ALLOWED_TOOLS: list[str] = [
-    "Read", "Grep", "Glob",
-    "Bash(git fetch:*)", "Bash(git show:*)", "Bash(git grep:*)", "Bash(git log:*)",
-    "Bash(git diff:*)", "Bash(git branch:*)", "Bash(git ls-tree:*)",
-    "Bash(git rev-parse:*)", "Bash(git symbolic-ref:*)",
-    "Bash(gh pr view:*)", "Bash(gh pr list:*)", "Bash(gh pr diff:*)",
-]
-
-
 def _mcp(prefix: str, names: str) -> list[str]:
     return [prefix + n for n in names.split()]
+
+
+# Pre-approved (skip the permission prompt): read-only tools, read-only git/gh, and
+# explicitly named read-only connector tools (no wildcards). Linear write tools are
+# deliberately absent so they reach the permission prompt.
+ALLOWED_TOOLS: list[str] = (
+    ["Read", "Grep", "Glob", "ToolSearch", "Agent",
+     "Bash(git fetch:*)", "Bash(git show:*)", "Bash(git grep:*)", "Bash(git log:*)",
+     "Bash(git rev-parse:*)", "Bash(git symbolic-ref:*)",
+     "Bash(gh pr view:*)", "Bash(gh pr diff:*)"]
+    + _mcp("mcp__claude_ai_Linear__", """get_issue list_issues list_comments list_teams get_team
+        list_users get_user whoami list_issue_labels list_issue_statuses get_issue_status
+        list_projects get_project list_cycles list_documents get_document list_milestones
+        get_milestone list_templates get_template get_attachment extract_images""")
+    + _mcp("mcp__claude_ai_Slack__", """slack_read_channel slack_read_thread slack_search_public
+        slack_search_public_and_private slack_search_channels slack_search_users
+        slack_read_user_profile slack_read_file slack_read_canvas""")
+    + _mcp("mcp__claude_ai_Notion__", """notion-search notion-fetch notion-connector-search
+        notion-query-meeting-notes notion-query-data-sources notion-get-comments""")
+    + _mcp("mcp__claude_ai_Google_Drive__",
+           "search_files read_file_content get_file_metadata list_recent_files")
+    + _mcp("mcp__claude_ai_Google_Calendar__", "list_events search_events get_event list_calendars")
+)
 
 
 # Hard-blocked even if the user's own settings pre-allow them. Linear is NOT here:
 # Linear writes must reach the permission prompt, not be silently blocked.
 DISALLOWED_TOOLS: list[str] = (
-    ["Bash(git add:*)", "Bash(git clone *)", "Bash(pip install:*)"]
+    ["Bash(git add:*)", "Bash(git clone *)", "Bash(pip install:*)", "Bash(pip3 install:*)",
+     "Bash(python3 -m pip install:*)", "Bash(uv add:*)", "Bash(uv pip install:*)"]
     + _mcp("mcp__claude_ai_Slack__", """slack_add_list_record slack_add_reaction
         slack_complete_file_upload slack_create_canvas slack_create_conversation slack_create_list
         slack_get_file_upload_url slack_schedule_message slack_send_message slack_send_message_draft
