@@ -4,7 +4,7 @@
 // is shown literally instead of being run. Chat is plain text (white-space: pre-wrap in CSS).
 import {
   STATUS_LABELS, PHASES, MAX_TITLE, MAX_REQUEST, phaseTracker, applyEvent, emptyChat,
-  countNeedsYou, validateNewTicket, nextBackoffMs,
+  countNeedsYou, validateNewTicket, nextBackoffMs, permissionView, claimClick, safeStatus,
 } from "/static/board.js";
 
 const NEAR_BOTTOM_PX = 80;
@@ -78,10 +78,11 @@ const views = new Map(); // column id -> view
 function renderHead(v) {
   const c = v.column;
   v.title.textContent = c.title;
-  v.badge.className = `badge ${c.status}`;
-  const label = c.label || STATUS_LABELS[c.status] || c.status;
+  const status = safeStatus(c.status); // whitelisted before it becomes a class name
+  v.badge.className = `badge ${status}`;
+  const label = c.label || STATUS_LABELS[status] || "Unknown";
   v.badge.textContent = `● ${label}${c.note ? ": " + c.note : ""}`;
-  v.root.className = `column ${c.status}`;
+  v.root.className = `column ${status}`;
   v.phases.replaceChildren();
   const steps = phaseTracker(PHASES, c.completed, c.phase, c.status);
   steps.forEach((s, i) => {
@@ -97,28 +98,37 @@ function permissionBlock(v, e) {
   const box = el("div", "perm");
   box.append(el("div", "perm-title", `Permission needed: ${e.tool}`), el("div", "perm-summary", e.summary));
   const row = el("div", "row");
-  const answered = e.request_id in v.chat.answered ? v.chat.answered[e.request_id]
-    : e.request_id in v.localAnswers ? v.localAnswers[e.request_id] : undefined;
-  if (answered === undefined) {
+  const state = permissionView(v.chat, e, { pending: v.pending, pendingAsOfSeq: v.pendingAsOfSeq, clicked: v.clicked });
+  if (state === "open" || state === "sending") {
     const allow = el("button", "allow", "Allow"), deny = el("button", "deny", "Deny");
+    const buttons = [allow, deny];
     for (const [btn, ok] of [[allow, true], [deny, false]]) {
       btn.type = "button";
-      btn.disabled = !v.connected;
-      btn.addEventListener("click", () => answerPermission(v, e.request_id, ok));
+      btn.disabled = !v.connected || state === "sending";
+      btn.addEventListener("click", () => answerPermission(v, e.request_id, ok, buttons));
       row.append(btn);
     }
+    if (state === "sending") row.append(el("span", "result muted", "Sending…"));
+  } else if (state === "expired") {
+    row.append(el("span", "result muted", "Expired: this request is no longer pending."));
   } else {
-    row.append(el("span", "result", answered ? "Allowed" : "Denied"));
+    row.append(el("span", "result", state === "allowed" ? "Allowed" : "Denied"));
   }
   box.append(row);
   return box;
 }
 
-function answerPermission(v, requestId, allow) {
+// "Allowed"/"Denied" appear only when the server's permission_answer event arrives.
+function answerPermission(v, requestId, allow, buttons) {
+  const claim = claimClick(v.clicked, requestId);
+  if (!claim.ok) return; // double click, or Allow then Deny: only the first counts
+  for (const b of buttons) b.disabled = true; // at once, before any re-render
   if (v.socket.send({ type: "permission", request_id: requestId, allow })) {
-    v.localAnswers[requestId] = allow;
-    scheduleChat(v);
+    v.clicked = claim.clicked;
+  } else {
+    for (const b of buttons) b.disabled = !v.connected;
   }
+  scheduleChat(v);
 }
 
 function eventNode(v, e) {
@@ -127,6 +137,7 @@ function eventNode(v, e) {
     case "assistant_text": return el("div", "msg assistant", e.text);
     case "tool_activity": return el("div", "tool", `${e.tool}: ${e.summary}`);
     case "session_error": return el("div", "err", e.message);
+    case "system_note": return el("div", "note", e.message);
     case "permission_request": return permissionBlock(v, e);
     default: return null; // turn_finished, permission_answer: state only
   }
@@ -154,6 +165,7 @@ function sendReply(v) {
   const text = v.input.value;
   if (!text.trim()) return;
   if (v.socket.send({ type: "message", text })) { v.input.value = ""; v.transientError = null; }
+  v.input.focus();
 }
 
 function setConnected(v, up) {
@@ -172,6 +184,11 @@ function onColumnMessage(v, data) {
   } else if (data.kind === "status") {
     v.column = { ...v.column, ...data.status };
     renderHead(v);
+    if (Array.isArray(data.pending)) {
+      v.pending = data.pending; // still-open request ids, as of everything received so far
+      v.pendingAsOfSeq = v.chat.lastSeq;
+      scheduleChat(v);
+    }
   } else if (data.kind === "error") {
     v.transientError = String(data.error); // not history: cleared by the next event
     scheduleChat(v);
@@ -179,8 +196,8 @@ function onColumnMessage(v, data) {
 }
 
 function buildView(column) {
-  const v = { column, chat: emptyChat(), localAnswers: {}, connected: false, firstRender: true,
-    chatQueued: false, transientError: null };
+  const v = { column, chat: emptyChat(), clicked: {}, pending: null, pendingAsOfSeq: 0,
+    connected: false, firstRender: true, chatQueued: false, transientError: null };
   v.root = el("section");
   v.title = el("span");
   const closeBtn = el("button", "close-btn", "✕");
@@ -197,6 +214,7 @@ function buildView(column) {
   v.chatBox = el("div", "chat");
   v.input = el("textarea");
   v.input.placeholder = "Reply…"; v.input.disabled = true;
+  v.input.setAttribute("aria-label", `Reply to ${column.title}`);
   v.input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); sendReply(v); }
   });
@@ -222,7 +240,10 @@ async function onClose(v) {
 }
 
 // ---------- board ----------
+let boardLoaded = false; // no "No open tickets" until the server has actually said so
+
 function syncColumns(columns) {
+  boardLoaded = true;
   const board = $("board");
   const ids = new Set(columns.map((c) => c.id));
   for (const [id, v] of views) {
@@ -233,7 +254,7 @@ function syncColumns(columns) {
     if (!v) { v = buildView(c); views.set(c.id, v); board.append(v.root); }
     else { v.column = { ...v.column, ...c }; renderHead(v); }
   }
-  $("empty").hidden = columns.length > 0;
+  $("empty").hidden = !boardLoaded || columns.length > 0;
   $("open-count").textContent = `${columns.length} open`;
   const needs = countNeedsYou(columns);
   $("needs-count").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
@@ -294,7 +315,9 @@ function setupDialogs() {
 connectSocket({
   path: () => "/ws/board",
   onMessage: (d) => { if (d.kind === "columns") syncColumns(d.columns); },
-  onState: () => {},
+  onState: (up) => {
+    $("board-conn").hidden = up;
+    if (!up) $("empty").hidden = true; // unknown while the server is unreachable
+  },
 });
 setupDialogs();
-syncColumns([]);

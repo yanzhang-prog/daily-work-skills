@@ -18,8 +18,40 @@ export function phaseTracker(phases, completed, current, status) {
   });
 }
 
+const hasOwn = (obj, key) => obj != null && Object.prototype.hasOwnProperty.call(obj, key);
+
+/** Status name safe to use in a class attribute; anything unexpected becomes "unknown". */
+export function safeStatus(status) {
+  return typeof status === "string" && hasOwn(STATUS_LABELS, status) ? status : "unknown";
+}
+
 export function emptyChat() {
   return { events: [], lastSeq: 0, answered: {} };
+}
+
+export function isAnswered(chat, requestId) {
+  return hasOwn(chat.answered, requestId);
+}
+
+/**
+ * How to draw one permission_request. Only a permission_answer EVENT from the server makes it
+ * "allowed"/"denied" (never the click itself). `pending` is the server's list of still-open
+ * request ids as of chat seq `pendingAsOfSeq`; a request at or before that seq that is not in
+ * the list can no longer be answered ("expired", e.g. replayed after a restart). A newer
+ * request, or no list yet, is "open". "sending" = clicked, answer not back yet.
+ */
+export function permissionView(chat, request, { pending, pendingAsOfSeq, clicked }) {
+  const id = request.request_id;
+  if (isAnswered(chat, id)) return chat.answered[id] ? "allowed" : "denied";
+  if (Array.isArray(pending) && request.seq <= pendingAsOfSeq && !pending.includes(id)) return "expired";
+  if (hasOwn(clicked, id)) return "sending";
+  return "open";
+}
+
+/** Double-click guard: the first click for a request wins; later clicks are ignored. */
+export function claimClick(clicked, requestId) {
+  if (hasOwn(clicked, requestId)) return { ok: false, clicked };
+  return { ok: true, clicked: { ...clicked, [requestId]: true } };
 }
 
 /**
@@ -35,7 +67,9 @@ export function applyEvent(state, event) {
   const events = [...state.events, event].sort((a, b) => a.seq - b.seq);
   const answered = { ...state.answered };
   if (event.type === "permission_answer" && typeof event.request_id === "string") {
-    answered[event.request_id] = event.allow === true;
+    Object.defineProperty(answered, event.request_id, {
+      value: event.allow === true, enumerable: true, writable: true, configurable: true,
+    }); // defineProperty: a "__proto__" id stays a plain key
   }
   return { events, lastSeq: Math.max(state.lastSeq, event.seq), answered };
 }

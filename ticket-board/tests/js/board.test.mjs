@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   STATUS_LABELS, phaseTracker, applyEvent, emptyChat, countNeedsYou, validateNewTicket, nextBackoffMs,
+  permissionView, claimClick, safeStatus, isAnswered,
 } from "../../static/board.js";
 
 const PHASES = ["Investigate", "Decide", "Shape", "Draft", "Create"];
@@ -131,4 +132,63 @@ test("validateNewTicket: non-strings are rejected", () => {
 
 test("nextBackoffMs: 1s, 2s, 4s, 8s then capped at 15s", () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 50].map(nextBackoffMs), [1000, 2000, 4000, 8000, 15000, 15000, 15000]);
+});
+
+// ---------- final fix wave: C1 permission state, C4 class whitelist ----------
+const req = (seq, id = "r1") => ev(seq, "permission_request", { request_id: id, tool: "Bash", summary: "x" });
+const ans = (seq, allow, id = "r1") => ev(seq, "permission_answer", { request_id: id, allow });
+
+test("permissionView: shows Allowed only after the permission_answer event, not on click", () => {
+  let chat = applyEvent(emptyChat(), req(1));
+  const live = { pending: ["r1"], pendingAsOfSeq: 1, clicked: {} };
+  assert.equal(permissionView(chat, req(1), live), "open");
+  const clicked = { ...live, clicked: { r1: true } };
+  assert.equal(permissionView(chat, req(1), clicked), "sending"); // not "allowed" yet
+  chat = applyEvent(chat, ans(2, true));
+  assert.equal(permissionView(chat, req(1), clicked), "allowed");
+  chat = applyEvent(applyEvent(emptyChat(), req(1)), ans(2, false));
+  assert.equal(permissionView(chat, req(1), live), "denied");
+});
+
+test("permissionView: answer arriving before its request still shows the answer", () => {
+  let chat = applyEvent(emptyChat(), ans(2, true));
+  chat = applyEvent(chat, req(1));
+  assert.equal(permissionView(chat, req(1), { pending: [], pendingAsOfSeq: 2, clicked: {} }), "allowed");
+});
+
+test("permissionView: an unanswered request that is no longer pending is expired (no buttons)", () => {
+  const chat = applyEvent(emptyChat(), req(1)); // e.g. replayed after a server restart
+  assert.equal(permissionView(chat, req(1), { pending: [], pendingAsOfSeq: 5, clicked: {} }), "expired");
+  // a click that the server rejected (no longer pending) must not stay "sending" for ever
+  assert.equal(permissionView(chat, req(1), { pending: [], pendingAsOfSeq: 5, clicked: { r1: true } }), "expired");
+});
+
+test("permissionView: a request newer than the last pending list is still open", () => {
+  const chat = applyEvent(emptyChat(), req(7));
+  assert.equal(permissionView(chat, req(7), { pending: [], pendingAsOfSeq: 6, clicked: {} }), "open");
+  assert.equal(permissionView(chat, req(7), { pending: null, pendingAsOfSeq: 0, clicked: {} }), "open");
+});
+
+test("claimClick: second click for the same request is ignored (Allow then Deny sends once)", () => {
+  const a = claimClick({}, "r1");
+  assert.equal(a.ok, true);
+  const b = claimClick(a.clicked, "r1");
+  assert.equal(b.ok, false);
+  assert.deepEqual(b.clicked, a.clicked);
+  assert.equal(claimClick(a.clicked, "r2").ok, true);
+  assert.equal(claimClick({}, "__proto__").ok, true); // prototype keys are not "already clicked"
+  assert.equal(claimClick(claimClick({}, "toString").clicked, "toString").ok, false);
+});
+
+test("isAnswered ignores prototype keys", () => {
+  assert.equal(isAnswered(emptyChat(), "constructor"), false);
+  assert.equal(isAnswered(emptyChat(), "toString"), false);
+});
+
+test("safeStatus whitelists status names before they become class names", () => {
+  assert.equal(safeStatus("needs_you"), "needs_you");
+  assert.equal(safeStatus("stuck"), "stuck");
+  assert.equal(safeStatus('x" onclick="y'), "unknown");
+  assert.equal(safeStatus("constructor"), "unknown");
+  assert.equal(safeStatus(undefined), "unknown");
 });
