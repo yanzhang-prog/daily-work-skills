@@ -85,3 +85,7 @@ DISALLOWED_TOOLS: list[str] = (
     + _mcp("mcp__claude_ai_Google_Drive__", "copy_file create_file share_file trash_file update_file")
     + _mcp("mcp__claude_ai_Claude_Docs__", "batch create delete update")
 )
+
+
+# Where sessions run (the repo holding the linear-* skills). Other REPOS are added as add_dirs.
+SESSION_CWD: Path = Path("/Users/yanzhang/daily-work-skills")
