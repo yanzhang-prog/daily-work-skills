@@ -27,10 +27,18 @@ NOT_RUNNING = "session is not running"
 # Only these input keys have their (redacted, truncated) value shown; all others show a size.
 _SAFE_KEYS = {"file_path", "path", "pattern", "url", "title", "name", "query", "team", "project",
               "state", "label", "labels", "assignee", "id", "issue", "command"}
-_REDACTIONS = [
+_REDACTIONS = [  # ordered; each replaces the secret part with <redacted>
+    re.compile(r"(?i)authorization\s*[=:]\s*\S+(\s+\S+)?"),
     re.compile(r"(?i)bearer\s+\S+"),
-    re.compile(r"(?i)(token|password|passwd|secret|authorization|api[_-]?key|cookie|credential)\s*[=:]\s*\S+"),
+    re.compile(r"(?i)[\w-]*(token|password|passwd|secret|api[_-]?key|apikey|access[_-]?key|cookie"
+               r"|credential|auth)[\w-]*\s*[=:]\s*\S+"),
+    re.compile(r'(?i)"[\w-]*(token|password|passwd|secret|api[_-]?key|cookie|credential|auth)[\w-]*"'
+               r'\s*:\s*"[^"]*"'),
+    re.compile(r"(?i)--[\w-]*(token|password|passwd|secret|api[_-]?key|key)[\w-]*[ =]\S+"),
+    re.compile(r"(?i)(?<!\S)-u\s+\S+:\S+"),
+    re.compile(r"(?i)[?&](token|access_token|api_key|key|sig|signature|secret|password)=[^&\s]+"),
     re.compile(r"://[^/\s:@]+:[^@\s]+@"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
 ]
 
 
@@ -142,6 +150,8 @@ class ClaudeSession:
         )
 
     async def start(self, resume: str | None = None) -> None:
+        if self._closed or self._client is not None:
+            raise RuntimeError("start() can only be called once, before close()")
         self._client = self._factory(self._build_options(resume))
         try:
             await self._client.connect()
@@ -162,6 +172,9 @@ class ClaudeSession:
         while True:
             text = await self._inbox.get()
             if not await self._run_turn(text):
+                while not self._inbox.empty():  # report, never silently drop, queued messages
+                    self._inbox.get_nowait()
+                    self._emit(SessionError("message not delivered: session failed", _now()))
                 return
 
     async def _run_turn(self, text: str) -> bool:

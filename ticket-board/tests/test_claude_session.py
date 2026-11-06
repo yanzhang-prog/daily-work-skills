@@ -266,7 +266,7 @@ def test_summary_redacts_key_value_secret():
     assert "sk-zzz" not in out and "<redacted>" in out
 
 
-async def test_close_is_idempotent_single_sentinel():
+async def test_close_twice_is_safe_and_events_end_empty():
     s, c = await started()
     await s.close()
     await s.close()
@@ -303,3 +303,49 @@ async def test_start_failure_emits_error_and_events_end_on_close():
     assert isinstance(ev, SessionError) and "ConnectionError" in ev.message
     await s.close()
     assert [e async for e in s.events()] == []
+
+
+@pytest.mark.parametrize("text,secret", [
+    ('curl -H "Authorization: Basic dXNlcjpw" http://x', "dXNlcjpw"),
+    ('curl -H "Authorization: Bearer abc123" http://x', "abc123"),
+    ("tool --token abc123 run", "abc123"),
+    ('curl -d \'{"token": "abc123"}\' http://x', "abc123"),
+    ("AWS_SECRET_ACCESS_KEY=abc123 aws s3 ls", "abc123"),
+    ("curl -u user:pass123 http://x", "pass123"),
+    ("curl https://x.test/a?sig=abc123&x=1", "abc123"),
+    ("echo sk-abcdefgh12345678", "sk-abcdefgh12345678"),
+    ("curl -H 'X-Api-Key: abc123' http://x", "abc123"),
+])
+def test_summary_redacts_secret_forms(text, secret):
+    out = summarize("Bash", {"command": text})
+    assert secret not in out and "<redacted>" in out
+
+
+def test_summary_leaves_harmless_command_alone():
+    assert summarize("Bash", {"command": "git show origin/main:README.md"}) == \
+        "Bash command=git show origin/main:README.md"
+
+
+async def test_failed_turn_reports_dropped_queued_messages():
+    s, c = await started(raises=RuntimeError("boom"))
+    for t in ("one", "two", "three"):
+        await s.send(t)
+    evs = [await next_event(s) for _ in range(3)]
+    assert evs[0].message.startswith("RuntimeError")
+    assert [e.message for e in evs[1:]] == ["message not delivered: session failed"] * 2
+    assert c.queries == ["one"]
+    await s.close()
+
+
+async def test_start_twice_raises():
+    s, c = await started()
+    with pytest.raises(RuntimeError):
+        await s.start()
+    await s.close()
+
+
+async def test_start_after_close_raises():
+    s, holder = make()
+    await s.close()
+    with pytest.raises(RuntimeError):
+        await s.start()
