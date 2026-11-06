@@ -7,11 +7,19 @@ from pathlib import Path
 HOST: str = "127.0.0.1"
 PORT: int = 8765
 
+# Input limits for the HTTP/WebSocket API.
+MAX_TITLE_CHARS: int = 120
+MAX_TEXT_CHARS: int = 20000
+
 # Test/dev switch: run fake sessions instead of real Claude sessions.
 USE_FAKE_SESSIONS: bool = os.environ.get("TICKET_BOARD_FAKE") == "1"
 
 HANDOFF_DIR: Path = Path.home() / ".claude" / "linear-work"
 STATE_FILE: Path = Path.home() / ".claude" / "ticket-board" / "columns.json"
+
+HISTORY_DIR: Path = Path.home() / ".claude" / "ticket-board" / "history"
+HANDOFF_POLL_SECONDS: float = 5
+FAKE_SESSION_DELAY_SECONDS: float = 0.3
 
 STUCK_AFTER_SECONDS: int = 300
 FETCH_TIMEOUT_SECONDS: int = 30

@@ -12,3 +12,13 @@ on a stale or unrelated branch.
 - Look at a PR or branch only when Yan asks you to. If you are unsure whether to, ask Yan.
 - Never edit, create, or delete anything in a repo. They are read-only.
 """
+
+COLUMN_FIRST_MESSAGE_PROMPT = """\
+Use the linear-workflow skill for the request below.
+
+Use EXACTLY this file path as this work item's handoff file: {handoff_path}
+If the file does not exist, create it from the handoff template. Do not use any other path.
+
+Request:
+{request}
+"""
