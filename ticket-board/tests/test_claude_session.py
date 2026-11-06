@@ -19,23 +19,33 @@ def result(sid="sid-1"):
 
 
 class FakeClient:
-    def __init__(self, options, script=None, raises=None):
+    def __init__(self, options, script=None, raises=None, delay=0, connect_raises=None):
         self.options = options
+        self.delay = delay
+        self.connect_raises = connect_raises
+        self.current = None
         self.script = script if script is not None else [result()]
         self.raises = raises
         self.queries = []
         self.disconnected = False
 
     async def connect(self):
-        pass
+        if self.connect_raises:
+            raise self.connect_raises
 
     async def query(self, text):
         self.queries.append(text)
+        self.current = text
 
     async def receive_response(self):
         if self.raises:
             raise self.raises
         for m in self.script:
+            await asyncio.sleep(self.delay)
+            if isinstance(m, AssistantMessage):
+                m = AssistantMessage(content=[TextBlock(f"{self.current}:{b.text}") if isinstance(b, TextBlock) else b for b in m.content], model="m")
+            elif isinstance(m, ResultMessage):
+                m = result(f"sid-{self.current}")
             yield m
 
     async def disconnect(self):
@@ -134,15 +144,15 @@ async def test_close_denies_pending_requests():
 
 async def test_turn_finished_carries_session_id():
     script = [AssistantMessage(content=[TextBlock("hi"), ToolUseBlock("t1", "Read", {"file_path": "/a"})],
-                               model="m"), result("abc-123")]
+                               model="m"), result()]
     s, c = await started(script=script)
     await s.send("hello")
     evs = [await next_event(s) for _ in range(3)]
     assert c.queries == ["hello"]
-    assert isinstance(evs[0], AssistantText) and evs[0].text == "hi"
+    assert isinstance(evs[0], AssistantText) and evs[0].text == "hello:hi"
     assert isinstance(evs[1], ToolActivity) and evs[1].tool == "Read"
-    assert isinstance(evs[2], TurnFinished) and evs[2].session_id == "abc-123"
-    assert s.session_id == "abc-123"
+    assert isinstance(evs[2], TurnFinished) and evs[2].session_id == "sid-hello"
+    assert s.session_id == "sid-hello"
     await s.close()
 
 
@@ -173,7 +183,7 @@ async def test_options_use_disallowed_and_allowed_tools_and_no_bypass():
     assert config.DISALLOWED_TOOLS and config.ALLOWED_TOOLS
     assert o.disallowed_tools == config.DISALLOWED_TOOLS
     assert o.allowed_tools == config.ALLOWED_TOOLS
-    assert o.permission_mode not in ("bypassPermissions", "acceptEdits", "dontAsk", "auto")
+    assert o.permission_mode == "default"
     assert o.model == config.MODEL_NAME
     assert o.setting_sources == ["user", "project"]
     assert o.cwd == str(config.SESSION_CWD)
@@ -210,3 +220,86 @@ async def test_permission_summary_is_truncated():
     assert "FULLBODY" not in req.summary and secret not in req.summary
     await s.close()
     await asyncio.wait_for(task, 1)
+
+
+from integrations.claude_session import summarize
+
+
+async def test_two_quick_sends_are_serialized():
+    script = [AssistantMessage(content=[TextBlock("a")], model="m"),
+              AssistantMessage(content=[TextBlock("b")], model="m"), result()]
+    s, c = await started(script=script, delay=0.02)
+    await s.send("one")
+    await s.send("two")
+    evs = [await next_event(s, 3) for _ in range(6)]
+    kinds = [(type(e).__name__, getattr(e, "text", None) or getattr(e, "session_id", None)) for e in evs]
+    assert kinds == [("AssistantText", "one:a"), ("AssistantText", "one:b"), ("TurnFinished", "sid-one"),
+                     ("AssistantText", "two:a"), ("AssistantText", "two:b"), ("TurnFinished", "sid-two")]
+    assert c.queries == ["one", "two"]
+    await s.close()
+
+
+def test_summary_hides_body_but_shows_size_and_title():
+    out = summarize(LINEAR_WRITE, {"title": "X", "description": "BODYTEXT" * 150, "teamId": "abc"})
+    assert "title=X" in out and "description=1200 chars" in out
+    assert "BODYTEXT" not in out
+
+
+def test_summary_redacts_bearer_token():
+    out = summarize("Bash", {"command": 'curl -H "Authorization: Bearer abc123" http://x'})
+    assert "<redacted>" in out and "abc123" not in out
+
+
+def test_summary_redacts_url_credentials():
+    out = summarize("WebFetch", {"url": "https://user:pw123@host.example/p"})
+    assert "<redacted>" in out and "pw123" not in out
+
+
+def test_summary_nested_values_show_only_count():
+    out = summarize("X", {"labels": ["a", "b"], "payload": {"secret": "hunter2", "k": 1}, "items": [1, 2, 3]})
+    assert "payload=2 items" in out and "items=3 items" in out
+    assert "hunter2" not in out
+
+
+def test_summary_redacts_key_value_secret():
+    out = summarize("Bash", {"command": "export API_KEY=sk-zzz && run"})
+    assert "sk-zzz" not in out and "<redacted>" in out
+
+
+async def test_close_is_idempotent_single_sentinel():
+    s, c = await started()
+    await s.close()
+    await s.close()
+    seen = [e async for e in s.events()]
+    assert seen == []
+    assert s._queue.empty()
+
+
+async def test_send_after_close_emits_session_error():
+    s, c = await started()
+    await s.close()
+    await s.send("hi")
+    assert c.queries == []
+    seen = [e async for e in s.events()]
+    assert len(seen) == 1
+    assert isinstance(seen[0], SessionError) and seen[0].message == "session is not running"
+
+
+async def test_send_after_failure_emits_session_error():
+    s, c = await started(raises=RuntimeError("boom"))
+    await s.send("one")
+    assert isinstance(await next_event(s), SessionError)
+    await s.send("two")
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError) and ev.message == "session is not running"
+    await s.close()
+
+
+async def test_start_failure_emits_error_and_events_end_on_close():
+    s, holder = make(connect_raises=ConnectionError("no cli"))
+    await s.start()
+    assert not s.alive
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError) and "ConnectionError" in ev.message
+    await s.close()
+    assert [e async for e in s.events()] == []

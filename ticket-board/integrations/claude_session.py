@@ -5,6 +5,7 @@ a small, typed event stream plus an approval gate that can wait as long as the h
 All SDK specifics live here so the rest of the app (and the tests) never import the SDK.
 """
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -20,11 +21,17 @@ import config
 from prompts import COLUMN_REPO_CONTEXT_PROMPT
 
 SUMMARY_MAX_CHARS = 200
-VALUE_MAX_CHARS = 60
+VALUE_MAX_CHARS = 120
 ERROR_MAX_CHARS = 300
-# Input keys never shown in a summary (bulk content or likely secrets).
-_HIDDEN_KEY_PARTS = ("content", "body", "text", "description", "token", "secret",
-                     "password", "key", "authorization", "new_string", "old_string")
+NOT_RUNNING = "session is not running"
+# Only these input keys have their (redacted, truncated) value shown; all others show a size.
+_SAFE_KEYS = {"file_path", "path", "pattern", "url", "title", "name", "query", "team", "project",
+              "state", "label", "labels", "assignee", "id", "issue", "command"}
+_REDACTIONS = [
+    re.compile(r"(?i)bearer\s+\S+"),
+    re.compile(r"(?i)(token|password|passwd|secret|authorization|api[_-]?key|cookie|credential)\s*[=:]\s*\S+"),
+    re.compile(r"://[^/\s:@]+:[^@\s]+@"),
+]
 
 
 def _now() -> datetime:
@@ -66,19 +73,25 @@ class SessionError:
 
 Event = AssistantText | ToolActivity | PermissionRequest | TurnFinished | SessionError
 
-_END = object()  # queue sentinel: close() was called
+
+def _redact(text: str) -> str:
+    for rx in _REDACTIONS:
+        text = rx.sub("<redacted>", text)
+    return text
+
+
+def _describe(key: str, value: Any) -> str:
+    if isinstance(value, (list, dict, tuple, set)):
+        return f"{key}={len(value)} items"
+    if key not in _SAFE_KEYS:
+        return f"{key}={len(str(value))} chars"
+    s = _redact(" ".join(str(value).split()))
+    return f"{key}={s[:VALUE_MAX_CHARS] + '...' if len(s) > VALUE_MAX_CHARS else s}"
 
 
 def summarize(tool: str, tool_input: dict[str, Any] | None) -> str:
-    """Short, secret-free one-liner: tool name plus truncated scalar inputs."""
-    parts = []
-    for k, v in (tool_input or {}).items():
-        if any(h in str(k).lower() for h in _HIDDEN_KEY_PARTS):
-            continue
-        s = str(v).replace("\n", " ")
-        if len(s) > VALUE_MAX_CHARS:
-            s = s[:VALUE_MAX_CHARS] + "..."
-        parts.append(f"{k}={s}")
+    """Short one-liner: tool name plus safe inputs. Unsafe keys show only their size."""
+    parts = [_describe(str(k), v) for k, v in (tool_input or {}).items()]
     out = f"{tool} {' '.join(parts)}".strip()
     return out if len(out) <= SUMMARY_MAX_CHARS else out[:SUMMARY_MAX_CHARS - 3] + "..."
 
@@ -96,10 +109,12 @@ class ClaudeSession:
         self._client = None
         self._queue: asyncio.Queue = asyncio.Queue()
         self._pending: dict[str, asyncio.Future] = {}
-        self._tasks: set[asyncio.Task] = set()
+        self._inbox: asyncio.Queue = asyncio.Queue()
+        self._worker: asyncio.Task | None = None
         self._session_id: str | None = None
         self._alive = False
         self._closed = False
+        self._closed_evt = asyncio.Event()
 
     @property
     def session_id(self) -> str | None:
@@ -122,6 +137,7 @@ class ClaudeSession:
             allowed_tools=list(config.ALLOWED_TOOLS),
             disallowed_tools=list(config.DISALLOWED_TOOLS),
             can_use_tool=self._can_use_tool,
+            permission_mode="default",  # never a skip-permissions mode
             resume=resume,
         )
 
@@ -129,18 +145,26 @@ class ClaudeSession:
         self._client = self._factory(self._build_options(resume))
         try:
             await self._client.connect()
-            self._alive = True
         except Exception as e:  # noqa: BLE001 - any transport failure is surfaced as an event
             self._fail(e)
+            return
+        self._alive = True
+        self._worker = asyncio.create_task(self._work())
 
     async def send(self, text: str) -> None:
-        if self._client is None or self._closed:
+        if not self._alive or self._closed:
+            self._emit(SessionError(NOT_RUNNING, _now()))
             return
-        task = asyncio.create_task(self._run_turn(text))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._inbox.put_nowait(text)
 
-    async def _run_turn(self, text: str) -> None:
+    async def _work(self) -> None:
+        """The single consumer of the SDK stream: one turn at a time, in order."""
+        while True:
+            text = await self._inbox.get()
+            if not await self._run_turn(text):
+                return
+
+    async def _run_turn(self, text: str) -> bool:
         try:
             await self._client.query(text)
             async for msg in self._client.receive_response():
@@ -153,10 +177,12 @@ class ClaudeSession:
                 elif isinstance(msg, ResultMessage):
                     self._session_id = msg.session_id
                     self._emit(TurnFinished(msg.session_id, _now()))
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             self._fail(e)
+            return False
 
     def _fail(self, e: Exception) -> None:
         self._alive = False
@@ -166,7 +192,10 @@ class ClaudeSession:
         self._queue.put_nowait(event)
 
     async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any):
-        """Allow only exact ALLOWED_TOOLS matches at once; otherwise ask the human and wait."""
+        """Allow only exact ALLOWED_TOOLS matches at once; otherwise ask the human and wait.
+
+        Bash(...) rule patterns are enforced CLI-side and never equal a bare "Bash" here, so
+        unmatched Bash calls reach the human."""
         if tool_name in config.ALLOWED_TOOLS:
             return PermissionResultAllow()
         if self._closed:
@@ -194,23 +223,38 @@ class ClaudeSession:
         # Unknown id: ignored, nothing is ever allowed by default.
 
     async def events(self) -> AsyncIterator[Event]:
+        """Yield queued events; once close() was called, drain what is left and stop."""
         while True:
-            item = await self._queue.get()
-            if item is _END:
-                return
-            yield item
+            if self._queue.empty():
+                if self._closed:
+                    return
+                getter = asyncio.ensure_future(self._queue.get())
+                closer = asyncio.ensure_future(self._closed_evt.wait())
+                done, pending = await asyncio.wait({getter, closer}, return_when=asyncio.FIRST_COMPLETED)
+                for p in pending:
+                    p.cancel()
+                if getter not in done:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    continue
+                yield getter.result()
+            else:
+                yield self._queue.get_nowait()
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
+        self._closed_evt.set()
         self._alive = False
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_result(False)
-        for t in list(self._tasks):
-            t.cancel()
+        if self._worker is not None:
+            self._worker.cancel()
+            await asyncio.gather(self._worker, return_exceptions=True)
         if self._client is not None:
             try:
                 await self._client.disconnect()
             except Exception:  # noqa: BLE001 - best effort on shutdown
                 pass
-        self._queue.put_nowait(_END)
+        self._closed_evt.set()
