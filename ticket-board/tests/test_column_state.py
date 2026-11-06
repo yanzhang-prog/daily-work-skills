@@ -225,3 +225,78 @@ def test_updates_persist(tmp_path):
 def test_default_handoff_dir_comes_from_config(tmp_path):
     reg = ColumnRegistry(tmp_path / "c.json", clock=lambda: NOW)
     assert reg.add("x").handoff_path.parent == config.HANDOFF_DIR
+
+
+# ---------- final fix wave: B1 ----------
+
+def _four_with_one_corrupt(tmp_path):
+    path = tmp_path / "columns.json"
+    reg = ColumnRegistry(path, clock=lambda: NOW, handoff_dir=tmp_path / "h")
+    ids = [reg.add(t).id for t in ("a", "b", "c", "d")]
+    data = json.loads(path.read_text())
+    data["columns"][1] = {"id": 7, "title": None}  # one malformed record
+    path.write_text(json.dumps(data))
+    return path, ids
+
+
+def test_b1_one_bad_record_skips_only_that_record(tmp_path):
+    path, ids = _four_with_one_corrupt(tmp_path)
+    reg = ColumnRegistry(path, handoff_dir=tmp_path / "h")
+    assert sorted(c.id for c in reg.list(include_closed=True)) == sorted([ids[0], ids[2], ids[3]])
+
+
+def test_b1_bad_record_does_not_clobber_file_on_next_add(tmp_path):
+    path, ids = _four_with_one_corrupt(tmp_path)
+    reg = ColumnRegistry(path, handoff_dir=tmp_path / "h")
+    reg.add("e")
+    reg2 = ColumnRegistry(path, handoff_dir=tmp_path / "h")
+    kept = {c.id for c in reg2.list(include_closed=True)}
+    assert {ids[0], ids[2], ids[3]} <= kept and len(kept) == 4
+
+
+def test_b1_invalid_json_file_is_moved_to_bak_with_original_bytes(tmp_path):
+    path = tmp_path / "columns.json"
+    raw = b'{"columns": [ {"id": "abc", truncated'
+    path.write_bytes(raw)
+    reg = ColumnRegistry(path, handoff_dir=tmp_path / "h")
+    assert reg.list(include_closed=True) == []
+    bak = tmp_path / "columns.json.bak"
+    assert bak.read_bytes() == raw
+    reg.add("x")  # writing the new file leaves the backup alone
+    assert bak.read_bytes() == raw
+
+
+def test_b1_second_bad_file_gets_a_timestamped_bak(tmp_path):
+    path = tmp_path / "columns.json"
+    (tmp_path / "columns.json.bak").write_bytes(b"older backup")
+    path.write_bytes(b"{bad")
+    ColumnRegistry(path, clock=lambda: NOW, handoff_dir=tmp_path / "h")
+    assert (tmp_path / "columns.json.bak").read_bytes() == b"older backup"
+    stamped = [p for p in tmp_path.iterdir() if p.name.startswith("columns.json.") and p.name.endswith(".bak")
+               and p.name != "columns.json.bak"]
+    assert len(stamped) == 1 and stamped[0].read_bytes() == b"{bad"
+
+
+def test_b1_wrong_shape_file_is_backed_up_not_overwritten(tmp_path):
+    path = tmp_path / "columns.json"
+    path.write_text("[1, 2]")
+    ColumnRegistry(path, handoff_dir=tmp_path / "h").add("x")
+    assert (tmp_path / "columns.json.bak").read_text() == "[1, 2]"
+
+
+def test_b1_naive_created_at_loads_as_utc(tmp_path):
+    path = tmp_path / "columns.json"
+    path.write_text(json.dumps({"columns": [{"id": "ab12", "title": "t", "session_id": None,
+                                             "handoff_path": None, "created_at": "2026-11-06T10:00:00"}]}))
+    col = ColumnRegistry(path, handoff_dir=tmp_path).get("ab12")
+    assert col.created_at.tzinfo is not None
+    assert col.created_at == datetime(2026, 11, 6, 10, 0, tzinfo=timezone.utc)
+
+
+def test_b1_naive_datetimes_in_derive_status_do_not_raise():
+    naive_now = datetime(2026, 11, 6, 12, 0)
+    old_naive = naive_now - timedelta(seconds=config.STUCK_AFTER_SECONDS + 60)
+    r = derive_status(handoff=None, session=flags(last_event_at=old_naive), now=NOW)
+    assert r.status is Status.STUCK
+    r2 = derive_status(handoff=None, session=flags(last_event_at=NOW), now=naive_now)
+    assert r2.status is Status.WORKING

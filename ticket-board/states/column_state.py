@@ -1,9 +1,11 @@
 """Board columns: derived status (pure) and the persisted column registry."""
 
 import json
+import logging
 import os
 import re
 import secrets
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +18,12 @@ from states.handoff_state import HandoffSummary
 
 _NOTE_MAX = 120
 _SLUG_MAX = 50
+log = logging.getLogger("ticket_board")
+
+
+def as_utc(dt: datetime) -> datetime:
+    """Naive datetimes (old files, hand edits) are taken as UTC so comparisons never raise."""
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 class Status(StrEnum):
@@ -62,7 +70,7 @@ def derive_status(
         return ColumnStatus(Status.NEEDS_YOU, reason or "waiting for your reply")
 
     if session.last_event_at is not None:
-        silent = (now - session.last_event_at).total_seconds()
+        silent = (as_utc(now) - as_utc(session.last_event_at)).total_seconds()
         if silent > config.STUCK_AFTER_SECONDS:
             return ColumnStatus(Status.STUCK, f"no activity for {max(1, int(silent // 60))} min")
 
@@ -104,7 +112,7 @@ class Column:
             session_id=d.get("session_id"),
             handoff_path=Path(hp) if hp else None,
             repos_read=[str(r) for r in repos],
-            created_at=datetime.fromisoformat(d["created_at"]),
+            created_at=as_utc(datetime.fromisoformat(d["created_at"])),
             closed=bool(d.get("closed", False)),
         )
 
@@ -128,13 +136,59 @@ class ColumnRegistry:
         self._columns: dict[str, Column] = self._load()
 
     def _load(self) -> dict[str, Column]:
-        # Tolerant by design: a missing/corrupt file means "start empty", never a crash.
+        """Never crash and never lose columns: a bad record is skipped (the rest load); a file
+        that cannot be parsed at all is moved to a .bak BEFORE we start empty, so the next
+        save cannot overwrite the only copy. A file with skipped records is copied to a .bak
+        too, since the next save drops those records."""
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-            cols = [Column.from_json(d) for d in data["columns"]]
-            return {c.id: c for c in cols}
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            raw = self._path.read_bytes()
+        except FileNotFoundError:
             return {}
+        except OSError:
+            log.warning("column registry unreadable; starting empty")
+            self._backup(move=True)
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            records = data["columns"]
+            if not isinstance(records, list):
+                raise TypeError("columns is not a list")
+        except (ValueError, KeyError, TypeError, AttributeError):  # UnicodeDecodeError is a ValueError
+            log.warning("column registry is not valid JSON; moved aside, starting empty")
+            self._backup(move=True)
+            return {}
+        cols: dict[str, Column] = {}
+        bad = 0
+        for d in records:
+            try:
+                c = Column.from_json(d)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                bad += 1
+                continue
+            cols[c.id] = c
+        if bad:
+            log.warning("column registry: skipped %d malformed record(s)", bad)
+            self._backup(move=False)
+        return cols
+
+    def _backup(self, move: bool) -> Path | None:
+        bak = self._path.with_name(self._path.name + ".bak")
+        if bak.exists():
+            stamp = self._clock().strftime("%Y%m%dT%H%M%S%f")
+            bak = self._path.with_name(f"{self._path.name}.{stamp}.bak")
+            n = 1
+            while bak.exists():
+                bak = self._path.with_name(f"{self._path.name}.{stamp}-{n}.bak")
+                n += 1
+        try:
+            if move:
+                os.replace(self._path, bak)
+            else:
+                shutil.copy2(self._path, bak)
+        except OSError:
+            log.warning("column registry backup failed")
+            return None
+        return bak
 
     def _save(self) -> None:
         # Temp file in the same directory + os.replace: the swap is atomic, so a
