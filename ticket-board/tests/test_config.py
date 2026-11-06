@@ -15,7 +15,7 @@ def test_allowed_tools_exclude_linear_writes():
 def test_disallowed_tools_block_notion_writes_but_not_linear():
     assert "mcp__claude_ai_Notion__notion-create-pages" in config.DISALLOWED_TOOLS
     assert "mcp__claude_ai_Notion__notion-update-page" in config.DISALLOWED_TOOLS
-    assert not any("__Linear__" in t for t in config.DISALLOWED_TOOLS)
+    assert not any(t.startswith("mcp__claude_ai_Linear__") for t in config.DISALLOWED_TOOLS)
 
 
 def test_allowed_and_disallowed_do_not_overlap():
@@ -41,9 +41,10 @@ def test_allowed_bash_patterns_are_exactly_the_readonly_git_gh_set():
 
 def test_allowed_tools_have_no_linear_write_tools():
     verbs = ("save_", "delete_", "create_", "merge_", "share_", "unshare_")
-    for tool in config.ALLOWED_TOOLS:
-        if "__Linear__" in tool:
-            assert not any(v in tool for v in verbs), tool
+    linear = [t for t in config.ALLOWED_TOOLS if "claude_ai_Linear__" in t]
+    assert linear, "filter matched nothing; test would be vacuous"
+    for tool in linear:
+        assert not any(v in tool for v in verbs), tool
 
 
 def test_allowed_tools_include_linear_reads_and_toolsearch():
