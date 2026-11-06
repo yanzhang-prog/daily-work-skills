@@ -95,6 +95,11 @@ def _redact(text: str) -> str:
     return text
 
 
+def redact_text(text: str, limit: int = 200) -> str:
+    """Public: redact secrets from any error/diagnostic string before it is shown or stored."""
+    return _redact(str(text))[:limit]
+
+
 def _describe(key: str, value: Any) -> str:
     if isinstance(value, (list, dict, tuple, set)):
         return f"{key}={len(value)} items"
@@ -206,7 +211,7 @@ class ClaudeSession:
 
     def _fail(self, e: Exception) -> None:
         self._alive = False
-        self._emit(SessionError(f"{type(e).__name__}: {e}"[:ERROR_MAX_CHARS], _now()))
+        self._emit(SessionError(redact_text(f"{type(e).__name__}: {e}", ERROR_MAX_CHARS), _now()))
 
     def _emit(self, event: Event) -> None:
         self._queue.put_nowait(event)

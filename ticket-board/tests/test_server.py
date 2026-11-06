@@ -26,9 +26,11 @@ BASE = f"http://127.0.0.1:{config.PORT}"
 class ScriptedSession:
     """Stands in for ClaudeSession. The test thread pushes events with push()."""
 
-    def __init__(self, repo_lines, fail_start=False):
+    def __init__(self, repo_lines, fail_start=False, send_raises=False, close_raises=False):
         self.repo_lines = repo_lines
         self.fail_start = fail_start
+        self.send_raises = send_raises
+        self.close_raises = close_raises
         self.started = False
         self.resume = "unset"
         self.sent: list[str] = []
@@ -44,11 +46,13 @@ class ScriptedSession:
         self._loop = asyncio.get_running_loop()
         self._q = asyncio.Queue()
         if self.fail_start:
-            raise RuntimeError("boom")
+            raise RuntimeError("boom token=abc123 /Users/yanzhang/x")
         self.started = True
         self.alive = True
 
     async def send(self, text):
+        if self.send_raises:
+            raise RuntimeError("send failed api_key=sk-abc12345678")
         self.sent.append(text)
 
     async def answer_permission(self, request_id, allow):
@@ -66,6 +70,8 @@ class ScriptedSession:
         self.alive = False
         if self._q is not None:
             self._q.put_nowait(None)
+        if self.close_raises:
+            raise RuntimeError("close failed")
 
     def push(self, ev):
         self._loop.call_soon_threadsafe(self._q.put_nowait, ev)
@@ -77,16 +83,27 @@ def ok_snap(repo):
 
 class Harness:
     def __init__(self, tmp_path, snapshotter=ok_snap, handoff_reader=lambda p: None,
-                 fail_start=False, history=None, **kw):
+                 fail_start=False, history=None, send_raises=False, close_raises=False, **kw):
         self.tmp = tmp_path
         self.sessions: list[ScriptedSession] = []
         self.snap_calls = []
         self.factory_lines = []
         self.fail_start = fail_start
+        self.loop_thread = None
+        self.reader_threads = []
+        user_reader = handoff_reader
+
+        def reader(path):
+            self.reader_threads.append(threading.get_ident())
+            return user_reader(path)
+
+        handoff_reader = reader
 
         def factory(repo_lines):
+            self.loop_thread = threading.get_ident()  # factory runs on the event-loop thread
             self.factory_lines.append(repo_lines)
-            s = ScriptedSession(repo_lines, fail_start=self.fail_start)
+            s = ScriptedSession(repo_lines, fail_start=self.fail_start,
+                                send_raises=send_raises, close_raises=close_raises)
             self.sessions.append(s)
             return s
 
@@ -602,3 +619,138 @@ def test_index_and_static_served(tmp_path):
         r = c.get("/")
         assert r.status_code == 200 and "Ticket Board" in r.text
         assert c.get("/static/index.html").status_code == 200
+
+
+# ---------- fix round 1 ----------
+
+def history_text(h, cid):
+    p = h.history_dir / f"{cid}.jsonl"
+    return p.read_text() if p.exists() else ""
+
+
+def test_replacing_dead_session_closes_old_and_stops_old_pump(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        s0 = h.sessions[0]
+        s0.push(TurnFinished("sess-1", NOW))
+        wait_for(lambda: h.registry.get(col["id"]).session_id == "sess-1")
+        old_task = h.app.board.runtimes[col["id"]].task
+        s0.alive = False  # died without close(): its client would leak
+        with wsc(c, f"/ws/columns/{col['id']}"):
+            wait_for(lambda: len(h.sessions) == 2 and h.sessions[1].started)
+        assert s0.closed is True
+        wait_for(old_task.done)
+        s0.push(AssistantText("stale-event", NOW))
+        h.sessions[1].push(AssistantText("fresh-event", NOW))
+        wait_for(lambda: "fresh-event" in history_text(h, col["id"]))
+        assert "stale-event" not in history_text(h, col["id"])
+
+
+def test_failed_start_closes_the_session(tmp_path):
+    h = Harness(tmp_path, fail_start=True)
+    with h.client() as c:
+        create(c)
+        assert h.sessions[0].closed is True
+
+
+def test_start_failure_secrets_not_in_note_event_or_history(tmp_path):
+    h = Harness(tmp_path, fail_start=True)
+    with h.client() as c:
+        col = create(c)
+        assert "abc123" not in col["note"] and "abc123" not in status_of(c, col["id"])["note"]
+        with wsc(c, f"/ws/columns/{col['id']}") as ws:
+            m = recv_until(ws, lambda m: m["kind"] == "event" and m["event"]["type"] == "session_error")
+        assert "abc123" not in json.dumps(m)
+        assert "abc123" not in history_text(h, col["id"])
+        assert "boom" in col["note"]
+
+
+def test_session_error_event_message_is_redacted(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        h.sessions[0].push(SessionError("failed password=hunter2xyz here", NOW))
+        wait_for(lambda: status_of(c, col["id"])["status"] == "stuck")
+        assert "hunter2xyz" not in status_of(c, col["id"])["note"]
+        assert "hunter2xyz" not in history_text(h, col["id"])
+
+
+def test_handoff_reader_runs_off_the_event_loop_thread(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        create(c)
+        c.get("/api/columns")
+        time.sleep(0.2)  # let the poll run too
+        assert h.reader_threads and h.loop_thread is not None
+        assert all(t != h.loop_thread for t in h.reader_threads)
+
+
+async def test_concurrent_record_keeps_seq_strictly_increasing(tmp_path):
+    h = Harness(tmp_path)
+    board = h.app.board
+    col = h.registry.add("t")
+    rt = await board.primed(col)
+
+    async def writer(tag):
+        for i in range(50):
+            board.record(rt, "assistant_text", NOW, text=f"{tag}{i}")
+            await asyncio.sleep(0)
+
+    await asyncio.gather(writer("a"), writer("b"))
+    seqs = [e["seq"] for e in HistoryStore(h.history_dir).read_after(col.id)]
+    assert seqs == list(range(1, 101))
+
+
+def test_after_beyond_stored_max_still_gets_live_events(tmp_path):
+    h = Harness(tmp_path)
+    with h.client() as c:
+        col = create(c)
+        h.sessions[0].push(AssistantText("one", NOW))
+        wait_for(lambda: hist_len(h.history_dir, col["id"]) == 2)
+        with wsc(c, f"/ws/columns/{col['id']}?after=999999") as ws:
+            assert ws.receive_json()["kind"] == "status"  # replay was empty
+            dog = threading.Timer(3, ws.close)  # watchdog: a dropped event must fail, not hang
+            dog.start()
+            try:
+                h.sessions[0].push(AssistantText("live", NOW))
+                m = ws.receive_json()
+            finally:
+                dog.cancel()
+        assert m["kind"] == "event" and m["event"]["text"] == "live"
+
+
+def test_send_failure_keeps_column_stuck_with_redacted_note(tmp_path):
+    h = Harness(tmp_path, send_raises=True)
+    with h.client() as c:
+        r = c.post("/api/columns", json={"title": "t", "request": "r"})
+        assert r.status_code == 201
+        body = r.json()
+        assert body["status"] == "stuck" and "sk-abc12345678" not in body["note"]
+        assert "send failed" in body["note"]
+        assert [x["id"] for x in c.get("/api/columns").json()] == [body["id"]]
+        assert "sk-abc12345678" not in history_text(h, body["id"])
+
+
+def test_column_shows_working_starting_while_repos_fetch(tmp_path):
+    gate = threading.Event()
+    h = Harness(tmp_path, snapshotter=lambda repo: (gate.wait(5), ok_snap(repo))[1])
+    with h.client() as c:
+        t = threading.Thread(target=lambda: c.post("/api/columns", json={"title": "t", "request": "r"}))
+        t.start()
+        try:
+            row = wait_for(lambda: (c.get("/api/columns").json() or [None])[0])
+            assert row["status"] == "working" and row["note"] == "starting..."
+        finally:
+            gate.set()
+            t.join(5)
+        assert status_of(c, row["id"])["note"] != "starting..."
+
+
+def test_close_survives_session_close_failure(tmp_path):
+    h = Harness(tmp_path, close_raises=True)
+    with h.client() as c:
+        col = create(c)
+        assert c.delete(f"/api/columns/{col['id']}").status_code == 204
+        assert c.get("/api/columns").json() == []
+        assert h.registry.get(col["id"]).closed is True

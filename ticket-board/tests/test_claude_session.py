@@ -372,3 +372,18 @@ def test_summary_redacts_quoted_values_with_spaces(text):
 def test_summary_redacts_whole_cookie_header():
     out = summarize("Bash", {"command": "curl -H 'Cookie: a=b; c=d' http://x"})
     assert "<redacted>" in out and "a=b" not in out and "c=d" not in out
+
+
+async def test_start_failure_message_is_redacted():
+    s, _ = make(connect_raises=ConnectionError("no cli token=abc123 api_key=sk-secret9999"))
+    await s.start()
+    ev = await next_event(s)
+    assert "abc123" not in ev.message and "sk-secret9999" not in ev.message
+    assert "ConnectionError" in ev.message and "<redacted>" in ev.message
+
+
+def test_redact_text_public_wrapper_caps_input_and_output():
+    from integrations.claude_session import redact_text
+    assert "abc123" not in redact_text("boom token=abc123")
+    assert len(redact_text("x" * 5000)) == 200
+    assert len(redact_text("y" * 5000, limit=50)) == 50
