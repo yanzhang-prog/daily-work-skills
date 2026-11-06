@@ -22,8 +22,9 @@ def _now() -> datetime:
 
 class FakeClaudeSession:
     def __init__(self, repo_lines: list[str], client_factory=None, cwd=None,
-                 delay: float | None = None) -> None:
+                 delay: float | None = None, extra_allowed_tools: list[str] | None = None) -> None:
         self._repo_lines = repo_lines
+        self.extra_allowed_tools = list(extra_allowed_tools or [])  # unused: nothing is run
         self._delay = config.FAKE_SESSION_DELAY_SECONDS if delay is None else delay
         self._queue: asyncio.Queue = asyncio.Queue()
         self._pending: dict[str, asyncio.Future] = {}

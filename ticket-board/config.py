@@ -27,7 +27,12 @@ HANDOFF_POLL_SECONDS: float = 5
 FAKE_SESSION_DELAY_SECONDS: float = 0.3
 
 STUCK_AFTER_SECONDS: int = 300
-FETCH_TIMEOUT_SECONDS: int = 30
+FETCH_TIMEOUT_SECONDS: int = 30  # per git command
+# Upper bound for fetching all repos when a column starts (they run in parallel). With
+# START_TIMEOUT_SECONDS this bounds how long a column can show Working "starting...".
+SNAPSHOT_BUDGET_SECONDS: int = 90
+START_TIMEOUT_SECONDS: int = 60  # Claude session connect; a hung connect becomes Stuck
+CLOSE_LOCK_TIMEOUT_SECONDS: float = 5  # DELETE waits at most this long for a busy column
 
 MODEL_NAME: str = "claude-sonnet-5-5"
 
@@ -50,11 +55,22 @@ def _mcp(prefix: str, names: str) -> list[str]:
 
 # Pre-approved (skip the permission prompt): read-only tools, read-only git/gh, and
 # explicitly named read-only connector tools (no wildcards). Linear write tools are
-# deliberately absent so they reach the permission prompt.
+# deliberately absent so they reach the permission prompt. Per-repo `git -C <path> ...`
+# rules are added per session by integrations.claude_session.repo_git_rules(REPOS).
+#
+# fetch and symbolic-ref are EXACT commands (no `:*`): `git fetch <url> <refspec>` could write
+# arbitrary refs and `git symbolic-ref <name> <ref>` can repoint HEAD.
+#
+# Residual risk (ruling R24, documented, not parsed): a `:*` prefix rule cannot exclude flags.
+# `git grep -O<cmd>` / `--open-files-in-pager` runs a command, `git log --output=<file>` writes
+# a file, and `--ext-diff` / `--textconv` can run configured programs. Text pulled from Slack,
+# Linear or Notion could try to talk a session into these (prompt injection). The repo prompt
+# and the disallow list are the only guards; see README "Known limitations".
 ALLOWED_TOOLS: list[str] = (
     ["Read", "Grep", "Glob", "ToolSearch", "Agent",
-     "Bash(git fetch:*)", "Bash(git show:*)", "Bash(git grep:*)", "Bash(git log:*)",
-     "Bash(git rev-parse:*)", "Bash(git symbolic-ref:*)",
+     "Bash(git fetch)", "Bash(git fetch origin)",
+     "Bash(git show:*)", "Bash(git grep:*)", "Bash(git log:*)", "Bash(git rev-parse:*)",
+     "Bash(git symbolic-ref --short refs/remotes/origin/HEAD)",
      "Bash(gh pr view:*)", "Bash(gh pr diff:*)"]
     + _mcp("mcp__claude_ai_Linear__", """get_issue list_issues list_comments list_teams get_team
         list_users get_user whoami list_issue_labels list_issue_statuses get_issue_status
@@ -102,3 +118,12 @@ DISALLOWED_TOOLS: list[str] = (
 
 # Where sessions run (the repo holding the linear-* skills). Other REPOS are added as add_dirs.
 SESSION_CWD: Path = Path("/Users/yanzhang/daily-work-skills")
+
+# Settings files the startup guard reads (read-only) before real sessions may start: none may
+# pre-allow a Linear write tool or set defaultMode bypassPermissions (ruling R25).
+SETTINGS_FILES: list[Path] = [
+    Path.home() / ".claude" / "settings.json",
+    Path.home() / ".claude" / "settings.local.json",
+    SESSION_CWD / ".claude" / "settings.json",
+    SESSION_CWD / ".claude" / "settings.local.json",
+]

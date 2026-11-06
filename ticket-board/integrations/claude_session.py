@@ -7,16 +7,18 @@ a small, typed event stream plus an approval gate that can wait as long as the h
 All SDK specifics live here so the rest of the app (and the tests) never import the SDK.
 """
 import asyncio
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, PermissionResultAllow,
-    PermissionResultDeny, ResultMessage, TextBlock, ToolUseBlock,
+    PermissionResultDeny, ResultMessage, SystemMessage, TextBlock, ToolUseBlock,
 )
 
 import config
@@ -77,15 +79,25 @@ class PermissionRequest:
 class TurnFinished:
     session_id: str
     at: datetime
+    is_error: bool = False  # the turn hit an API/result error (a SessionError was emitted)
 
 
 @dataclass(frozen=True)
 class SessionError:
     message: str
     at: datetime
+    fatal: bool = True  # False: the session still runs (auth/billing/rate-limit, failed turn)
 
 
-Event = AssistantText | ToolActivity | PermissionRequest | TurnFinished | SessionError
+@dataclass(frozen=True)
+class SessionIdKnown:
+    """The Claude session id, as soon as the first message of a turn carries it (not only at
+    the end of the turn), so a server restart mid-investigation can still resume."""
+    session_id: str
+    at: datetime
+
+
+Event = AssistantText | ToolActivity | PermissionRequest | TurnFinished | SessionError | SessionIdKnown
 
 
 def _redact(text: str) -> str:
@@ -116,14 +128,66 @@ def summarize(tool: str, tool_input: dict[str, Any] | None) -> str:
     return out if len(out) <= SUMMARY_MAX_CHARS else out[:SUMMARY_MAX_CHARS - 3] + "..."
 
 
+def handoff_write_rule(handoff_path: Path | str) -> str:
+    """Permission rule allowing writes to exactly one file (ruling R21).
+
+    Claude Code rule syntax: `//` starts an absolute filesystem path, and an `Edit(...)` rule
+    covers the Edit, Write and NotebookEdit tools (checked in the bundled CLI 2.1.318, not in
+    a live session). No wildcard: only this one path."""
+    return f"Edit(//{str(handoff_path).lstrip('/')})"
+
+
+_GIT_PREFIX_VERBS = ("show", "grep", "log", "rev-parse")
+_GIT_EXACT = ("fetch", "fetch origin", "symbolic-ref --short refs/remotes/origin/HEAD")
+
+
+def repo_git_rules(repos) -> list[str]:
+    """Per-repo read-only `git -C <path> ...` rules (ruling R22). fetch and symbolic-ref are
+    exact commands; show/grep/log/rev-parse take arguments."""
+    rules = []
+    for r in repos:
+        p = str(r.path)
+        rules += [f"Bash(git -C {p} {v}:*)" for v in _GIT_PREFIX_VERBS]
+        rules += [f"Bash(git -C {p} {cmd})" for cmd in _GIT_EXACT]
+    return rules
+
+
+_FILE_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path"}
+
+
+def _inside(p: str, root: str) -> bool:
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+
+def activity_summary(tool: str, tool_input: dict[str, Any] | None, *, repos, cwd: Path,
+                     handoff_dir: Path) -> str:
+    """summarize(), prefixed `working tree: ` when Read/Grep/Glob reads a repo's files on disk
+    instead of origin/<default> (ruling R23: visible, not blocked). The skills folder and the
+    handoff folder are expected reads and stay unlabelled."""
+    out = summarize(tool, tool_input)
+    key = _FILE_TOOLS.get(tool)
+    if key is None:
+        return out
+    raw = (tool_input or {}).get(key) or str(cwd)  # Grep/Glob default to the session cwd
+    path = os.path.normpath(os.path.join(str(cwd), str(raw)))
+    if _inside(path, os.path.normpath(str(handoff_dir))):
+        return out
+    for r in repos:
+        root = os.path.normpath(str(r.path))
+        if _inside(path, root) and not _inside(path, os.path.join(root, "global-skills")):
+            return "working tree: " + out
+    return out
+
+
 def _default_factory(options: ClaudeAgentOptions):
     return ClaudeSDKClient(options)
 
 
 class ClaudeSession:
     def __init__(self, repo_lines: list[str], client_factory: Callable[[ClaudeAgentOptions], Any] | None = None,
-                 cwd=None) -> None:
+                 cwd=None, extra_allowed_tools: list[str] | None = None) -> None:
         self._repo_lines = repo_lines
+        self._extra_allowed = list(extra_allowed_tools or [])
         self._factory = client_factory or _default_factory
         self._cwd = cwd or config.SESSION_CWD
         self._client = None
@@ -154,7 +218,8 @@ class ClaudeSession:
             setting_sources=["user", "project"],
             system_prompt={"type": "preset", "preset": "claude_code",
                            "append": COLUMN_REPO_CONTEXT_PROMPT.format(repo_list=repo_list)},
-            allowed_tools=list(config.ALLOWED_TOOLS),
+            allowed_tools=(list(config.ALLOWED_TOOLS) + repo_git_rules(config.REPOS)
+                           + self._extra_allowed),
             disallowed_tools=list(config.DISALLOWED_TOOLS),
             can_use_tool=self._can_use_tool,
             permission_mode="default",  # never a skip-permissions mode
@@ -165,9 +230,9 @@ class ClaudeSession:
         if self._closed or self._client is not None:
             raise RuntimeError("start() can only be called once, before close()")
         self._client = self._factory(self._build_options(resume))
-        try:
-            await self._client.connect()
-        except Exception as e:  # noqa: BLE001 - any transport failure is surfaced as an event
+        try:  # a hung CLI start must not leave the column "starting..." forever
+            await asyncio.wait_for(self._client.connect(), config.START_TIMEOUT_SECONDS)
+        except Exception as e:  # noqa: BLE001 - any transport failure (or timeout) is an event
             self._fail(e)
             return
         self._alive = True
@@ -189,19 +254,42 @@ class ClaudeSession:
                     self._emit(SessionError("message not delivered: session failed", _now()))
                 return
 
+    def _learn_session_id(self, sid: Any) -> None:
+        if isinstance(sid, str) and sid and sid != self._session_id:
+            self._session_id = sid
+            self._emit(SessionIdKnown(sid, _now()))
+
+    def _turn_error(self, text: str) -> None:
+        """Non-fatal: the CLI is still running; the next message may well work."""
+        self._emit(SessionError(redact_text(text, ERROR_MAX_CHARS), _now(), fatal=False))
+
     async def _run_turn(self, text: str) -> bool:
         try:
             await self._client.query(text)
+            had_error = False
             async for msg in self._client.receive_response():
-                if isinstance(msg, AssistantMessage):
+                if isinstance(msg, SystemMessage):
+                    if msg.subtype == "init" and isinstance(msg.data, dict):
+                        self._learn_session_id(msg.data.get("session_id"))
+                elif isinstance(msg, AssistantMessage):
+                    self._learn_session_id(msg.session_id)
                     for b in msg.content:
                         if isinstance(b, TextBlock):
                             self._emit(AssistantText(b.text, _now()))
                         elif isinstance(b, ToolUseBlock):
-                            self._emit(ToolActivity(b.name, summarize(b.name, b.input), _now()))
+                            self._emit(ToolActivity(b.name, activity_summary(
+                                b.name, b.input, repos=config.REPOS, cwd=Path(self._cwd),
+                                handoff_dir=config.HANDOFF_DIR), _now()))
+                    if msg.error:
+                        had_error = True
+                        self._turn_error(f"Claude API error: {msg.error}")
                 elif isinstance(msg, ResultMessage):
+                    if msg.is_error and not had_error:
+                        status = f", HTTP {msg.api_error_status}" if msg.api_error_status else ""
+                        self._turn_error(f"turn failed ({msg.subtype}{status})")
+                    had_error = had_error or bool(msg.is_error)
                     self._session_id = msg.session_id
-                    self._emit(TurnFinished(msg.session_id, _now()))
+                    self._emit(TurnFinished(msg.session_id, _now(), is_error=had_error))
             return True
         except asyncio.CancelledError:
             raise

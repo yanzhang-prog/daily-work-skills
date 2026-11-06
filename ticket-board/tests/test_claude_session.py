@@ -1,5 +1,6 @@
 """All tests use a fake client with the same async interface as ClaudeSDKClient. No network."""
 import asyncio
+import dataclasses
 from datetime import timezone
 
 import pytest
@@ -42,10 +43,10 @@ class FakeClient:
             raise self.raises
         for m in self.script:
             await asyncio.sleep(self.delay)
-            if isinstance(m, AssistantMessage):
-                m = AssistantMessage(content=[TextBlock(f"{self.current}:{b.text}") if isinstance(b, TextBlock) else b for b in m.content], model="m")
+            if isinstance(m, AssistantMessage):  # keep error/session_id fields
+                m = dataclasses.replace(m, content=[TextBlock(f"{self.current}:{b.text}") if isinstance(b, TextBlock) else b for b in m.content])
             elif isinstance(m, ResultMessage):
-                m = result(f"sid-{self.current}")
+                m = dataclasses.replace(m, session_id=f"sid-{self.current}")
             yield m
 
     async def disconnect(self):
@@ -182,7 +183,8 @@ async def test_options_use_disallowed_and_allowed_tools_and_no_bypass():
     o = c.options
     assert config.DISALLOWED_TOOLS and config.ALLOWED_TOOLS
     assert o.disallowed_tools == config.DISALLOWED_TOOLS
-    assert o.allowed_tools == config.ALLOWED_TOOLS
+    from integrations.claude_session import repo_git_rules
+    assert o.allowed_tools == config.ALLOWED_TOOLS + repo_git_rules(config.REPOS)  # no extras given
     assert o.permission_mode == "default"
     assert o.model == config.MODEL_NAME
     assert o.setting_sources == ["user", "project"]
@@ -198,7 +200,7 @@ async def test_system_prompt_contains_repo_lines_and_git_fetch_rule():
     sp = c.options.system_prompt
     assert sp["type"] == "preset" and sp["preset"] == "claude_code"
     assert "- virtual-assistant-agent: /x/va (read origin/main)" in sp["append"]
-    assert "git fetch" in sp["append"]
+    assert "fetch origin" in sp["append"]
     await s.close()
 
 
@@ -387,3 +389,192 @@ def test_redact_text_public_wrapper_caps_input_and_output():
     assert "abc123" not in redact_text("boom token=abc123")
     assert len(redact_text("x" * 5000)) == 200
     assert len(redact_text("y" * 5000, limit=50)) == 50
+
+
+# ---------- final fix wave ----------
+from pathlib import Path
+
+from claude_agent_sdk import SystemMessage
+
+from config import RepoConfig
+
+
+class HangClient(FakeClient):
+    async def connect(self):
+        await asyncio.Event().wait()  # never returns
+
+
+async def test_a1_hung_connect_times_out_into_redacted_session_error(monkeypatch):
+    monkeypatch.setattr(config, "START_TIMEOUT_SECONDS", 0.05)
+    holder = {}
+
+    def factory(o):
+        holder["c"] = HangClient(o)
+        return holder["c"]
+
+    s = ClaudeSession(["x"], client_factory=factory)
+    await asyncio.wait_for(s.start(), 2)  # returns instead of hanging
+    assert not s.alive
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError) and "TimeoutError" in ev.message
+    assert ev.fatal is True
+    await s.close()
+
+
+def test_a1_start_timeout_is_configured():
+    assert config.START_TIMEOUT_SECONDS == 60
+
+
+async def test_a2_assistant_message_error_is_nonfatal_and_turn_still_finishes():
+    script = [AssistantMessage(content=[TextBlock("Invalid API key")], model="m",
+                               error="authentication_failed"), result()]
+    s, c = await started(script=script)
+    await s.send("q")
+    evs = [await next_event(s) for _ in range(3)]
+    assert isinstance(evs[0], AssistantText)
+    assert isinstance(evs[1], SessionError) and evs[1].fatal is False
+    assert "authentication_failed" in evs[1].message
+    assert isinstance(evs[2], TurnFinished) and evs[2].is_error is True
+    assert s.alive  # recoverable: the session keeps running
+    await s.close()
+
+
+async def test_a2_result_is_error_is_nonfatal_session_error():
+    bad = ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=True,
+                        num_turns=1, session_id="x", api_error_status=429)
+    s, c = await started(script=[bad])
+    await s.send("q")
+    e1, e2 = await next_event(s), await next_event(s)
+    assert isinstance(e1, SessionError) and e1.fatal is False and "429" in e1.message
+    assert isinstance(e2, TurnFinished) and e2.is_error is True and e2.session_id == "sid-q"
+    assert s.alive
+    await s.close()
+
+
+async def test_a2_clean_turn_is_not_error():
+    s, c = await started()
+    await s.send("q")
+    ev = await next_event(s)
+    assert isinstance(ev, TurnFinished) and ev.is_error is False
+    await s.close()
+
+
+async def test_b3_session_id_captured_from_init_message_before_turn_ends():
+    from integrations.claude_session import SessionIdKnown
+    script = [SystemMessage("init", {"type": "system", "subtype": "init", "session_id": "early-1"}),
+              AssistantMessage(content=[TextBlock("hi")], model="m"), result()]
+    s, c = await started(script=script, delay=0.01)
+    assert s.session_id is None
+    await s.send("q")
+    first = await next_event(s)
+    assert isinstance(first, SessionIdKnown) and first.session_id == "early-1"
+    assert s.session_id == "early-1"
+    assert isinstance(await next_event(s), AssistantText)
+    await s.close()
+
+
+async def test_b3_session_id_captured_from_assistant_message():
+    from integrations.claude_session import SessionIdKnown
+    script = [AssistantMessage(content=[TextBlock("hi")], model="m", session_id="early-2"), result()]
+    s, c = await started(script=script, delay=0.05)
+    await s.send("q")
+    first = await next_event(s)
+    assert isinstance(first, SessionIdKnown) and first.session_id == "early-2"
+    assert s.session_id == "early-2"
+    await s.close()
+
+
+def test_r21_handoff_write_rule_is_one_exact_absolute_path():
+    from integrations.claude_session import handoff_write_rule
+    p = Path("/Users/yan/.claude/linear-work/2026-11-06-add-search-ab12cd34.md")
+    assert handoff_write_rule(p) == "Edit(//Users/yan/.claude/linear-work/2026-11-06-add-search-ab12cd34.md)"
+    assert "*" not in handoff_write_rule(p)
+
+
+async def test_r21_session_options_get_exactly_the_extra_rule_per_column():
+    from integrations.claude_session import handoff_write_rule, repo_git_rules
+    rules = []
+    for name in ("a-1111.md", "b-2222.md"):
+        rule = handoff_write_rule(Path("/data/linear-work") / name)
+        holder = {}
+
+        def factory(o):
+            holder["c"] = FakeClient(o)
+            return holder["c"]
+
+        s = ClaudeSession(["x"], client_factory=factory, extra_allowed_tools=[rule])
+        await s.start()
+        base = config.ALLOWED_TOOLS + repo_git_rules(config.REPOS)
+        extra = [t for t in holder["c"].options.allowed_tools if t not in base]
+        assert extra == [rule]
+        assert config.ALLOWED_TOOLS.count(rule) == 0  # global list untouched
+        rules.append(rule)
+        await s.close()
+    assert rules[0] != rules[1] and rules[0].endswith("a-1111.md)")
+
+
+def test_r22_repo_git_rules_are_exact_per_repo():
+    from integrations.claude_session import repo_git_rules
+    rules = repo_git_rules([RepoConfig(Path("/a/r1")), RepoConfig(Path("/b/r2"))])
+    want = []
+    for p in ("/a/r1", "/b/r2"):
+        want += [f"Bash(git -C {p} show:*)", f"Bash(git -C {p} grep:*)", f"Bash(git -C {p} log:*)",
+                 f"Bash(git -C {p} rev-parse:*)", f"Bash(git -C {p} fetch)",
+                 f"Bash(git -C {p} fetch origin)",
+                 f"Bash(git -C {p} symbolic-ref --short refs/remotes/origin/HEAD)"]
+    assert rules == want
+
+
+def test_r22_no_rule_allows_writes_or_wildcard_fetch():
+    from integrations.claude_session import repo_git_rules
+    rules = repo_git_rules(config.REPOS)
+    assert len(rules) == 7 * len(config.REPOS)
+    for r in rules + config.ALLOWED_TOOLS:
+        if not r.startswith("Bash("):
+            continue
+        for bad in (" push", " checkout", " pull", " commit", " branch", " reset"):
+            assert bad not in r, r
+        if " fetch" in r or " symbolic-ref" in r:
+            assert "*" not in r, r
+
+
+async def test_r22_session_options_include_repo_git_rules():
+    from integrations.claude_session import repo_git_rules
+    s, c = await started()
+    for rule in repo_git_rules(config.REPOS):
+        assert rule in c.options.allowed_tools
+    await s.close()
+
+
+def test_r23_working_tree_reads_are_labelled():
+    from integrations.claude_session import activity_summary
+    repos = [RepoConfig(Path("/w/skills")), RepoConfig(Path("/w/va"))]
+    kw = dict(repos=repos, cwd=Path("/w/skills"), handoff_dir=Path("/h/linear-work"))
+    assert activity_summary("Read", {"file_path": "/w/va/src/a.py"}, **kw).startswith("working tree: Read ")
+    assert activity_summary("Grep", {"pattern": "x", "path": "/w/va"}, **kw).startswith("working tree: ")
+    assert activity_summary("Glob", {"pattern": "*.py"}, **kw).startswith("working tree: ")  # cwd default
+    assert activity_summary("Read", {"file_path": "src/x.py"}, **kw).startswith("working tree: ")  # relative
+    # not labelled: skills dir, handoff dir, outside repos, other tools
+    for tool, inp in [("Read", {"file_path": "/w/skills/global-skills/linear-workflow/SKILL.md"}),
+                      ("Read", {"file_path": "/h/linear-work/2026-a.md"}),
+                      ("Read", {"file_path": "/tmp/other.txt"}),
+                      ("Read", {"file_path": "/w/vault/x"}),  # prefix-alike, not inside /w/va
+                      ("Bash", {"command": "git -C /w/va show origin/main:a"})]:
+        assert not activity_summary(tool, inp, **kw).startswith("working tree:"), (tool, inp)
+
+
+async def test_r23_session_tool_activity_uses_working_tree_label():
+    repo = config.REPOS[-1].path
+    script = [AssistantMessage(content=[ToolUseBlock("t1", "Read", {"file_path": str(repo / "a.py")})],
+                               model="m"), result()]
+    s, c = await started(script=script)
+    await s.send("q")
+    ev = await next_event(s)
+    assert isinstance(ev, ToolActivity) and ev.summary.startswith("working tree: Read ")
+    await s.close()
+
+
+def test_fake_session_accepts_extra_allowed_tools():
+    from integrations.fake_session import FakeClaudeSession
+    f = FakeClaudeSession(["x"], extra_allowed_tools=["Edit(//a/b.md)"])
+    assert f.extra_allowed_tools == ["Edit(//a/b.md)"]

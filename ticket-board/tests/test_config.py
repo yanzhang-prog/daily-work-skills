@@ -24,13 +24,15 @@ def test_allowed_and_disallowed_do_not_overlap():
 
 def test_repo_prompt_formats_with_repo_list():
     text = prompts.COLUMN_REPO_CONTEXT_PROMPT.format(repo_list="x")
-    assert "git fetch" in text
+    assert "x" in text
+    assert "fetch origin" in text  # the board fetches; sessions refetch only on request
     assert "origin/" in text
 
 
 READONLY_BASH = {
-    "Bash(git fetch:*)", "Bash(git show:*)", "Bash(git grep:*)", "Bash(git log:*)",
-    "Bash(git rev-parse:*)", "Bash(git symbolic-ref:*)",
+    "Bash(git fetch)", "Bash(git fetch origin)",
+    "Bash(git show:*)", "Bash(git grep:*)", "Bash(git log:*)", "Bash(git rev-parse:*)",
+    "Bash(git symbolic-ref --short refs/remotes/origin/HEAD)",
     "Bash(gh pr view:*)", "Bash(gh pr diff:*)",
 }
 
@@ -83,3 +85,32 @@ def test_data_dir_default_is_under_home_claude(monkeypatch):
         assert reloaded.HISTORY_DIR == Path.home() / ".claude" / "ticket-board" / "history"
     finally:
         importlib.reload(config)
+
+
+def test_r22_repo_prompt_rules():
+    text = prompts.COLUMN_REPO_CONTEXT_PROMPT.format(repo_list="x")
+    assert "one git command per Bash call" in text
+    assert "no pipes" in text and "no chaining" in text and "no redirects" in text
+    assert "git -C <repo path>" in text
+    assert "already fetched" in text and "only need to fetch again if Yan asks" in text
+    assert "not searched" in text and "tell Yan" in text
+
+
+def test_b2_resume_fallback_prompt_has_handoff_path_field():
+    text = prompts.COLUMN_RESUME_FALLBACK_PROMPT.format(handoff_path="/x/y.md")
+    assert "/x/y.md" in text and "could not be resumed" in text
+
+
+def test_a1_timeouts_configured():
+    assert config.START_TIMEOUT_SECONDS == 60
+    assert config.CLOSE_LOCK_TIMEOUT_SECONDS == 5
+    assert config.SNAPSHOT_BUDGET_SECONDS > 0
+
+
+def test_d5_settings_files_list():
+    from pathlib import Path
+    home = Path.home() / ".claude"
+    assert config.SETTINGS_FILES == [
+        home / "settings.json", home / "settings.local.json",
+        config.SESSION_CWD / ".claude" / "settings.json",
+        config.SESSION_CWD / ".claude" / "settings.local.json"]

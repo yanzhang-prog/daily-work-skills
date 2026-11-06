@@ -1,7 +1,8 @@
 """Read-only git access for the configured repos.
 
-Only these git commands are ever run: fetch (no --prune), symbolic-ref, rev-parse, log -1,
-and ls-remote (read-only network call). Nothing here changes the checked-out branch, the
+Only these git commands are ever run: fetch (never prunes, even if the repo or user config
+sets fetch.prune; no gc/maintenance), symbolic-ref, rev-parse, log -1, and ls-remote
+(read-only network call). Nothing here changes the checked-out branch, the
 index or the working tree. The one write is fetch updating remote-tracking refs.
 
 Any failure yields a snapshot with error="not searched: <reason>" so callers never
@@ -30,11 +31,19 @@ class RepoSnapshot:
     error: str | None
 
 
-def _git(repo_path: Path, *args: str) -> str:
-    # List args, no shell. GIT_TERMINAL_PROMPT=0 makes missing credentials fail fast.
+# `-c` options win over repo and user config, so Yan's fetch.prune=true cannot delete his
+# remote-tracking refs, and a fetch never triggers gc or background maintenance.
+_FETCH_SAFE = ("-c", "fetch.prune=false", "-c", "fetch.pruneTags=false",
+               "-c", "gc.auto=0", "-c", "maintenance.auto=false")
+
+
+def _git(repo_path: Path, *args: str, pre: tuple[str, ...] = ()) -> str:
+    # List args, no shell. GIT_TERMINAL_PROMPT=0 and ssh BatchMode make missing credentials
+    # fail fast instead of waiting for a prompt nobody can answer.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
     try:
-        proc = subprocess.run(["git", "-C", str(repo_path), *args], capture_output=True,
+        proc = subprocess.run(["git", "-C", str(repo_path), *pre, *args], capture_output=True,
                               text=True, timeout=FETCH_TIMEOUT_SECONDS, env=env)
     except subprocess.TimeoutExpired:
         raise RepoError(f"git {args[0]} timed out after {FETCH_TIMEOUT_SECONDS}s") from None
@@ -70,7 +79,7 @@ def fetch_and_snapshot(repo: RepoConfig) -> RepoSnapshot:
     try:
         if not (repo.path / ".git").exists():
             raise RepoError("path missing or not a git repo")
-        _git(repo.path, "fetch", "origin")
+        _git(repo.path, "fetch", "origin", pre=_FETCH_SAFE)
         ref = default_ref(repo)
         sha = _git(repo.path, "rev-parse", "--verify", f"{ref}^{{commit}}")
         committed = _git(repo.path, "log", "-1", "--format=%cI", sha)
