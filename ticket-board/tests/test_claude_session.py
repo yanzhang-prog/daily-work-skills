@@ -349,3 +349,26 @@ async def test_start_after_close_raises():
     await s.close()
     with pytest.raises(RuntimeError):
         await s.start()
+
+
+@pytest.mark.parametrize("text", ["a" * 40000, "a" * 5000 + "=", "token=" * 500,
+                                  "Authorization: " * 500, "--key " * 800])
+def test_redaction_is_fast_on_long_input(text):
+    import time
+    t0 = time.perf_counter()
+    out = summarize("Bash", {"command": text})
+    assert time.perf_counter() - t0 < 0.2
+    assert len(out) <= 200
+
+
+@pytest.mark.parametrize("text", ['echo password: "my secret" done', "tool --password 'my secret' go",
+                                  'tool --password "my secret" go'])
+def test_summary_redacts_quoted_values_with_spaces(text):
+    out = summarize("Bash", {"command": text})
+    assert "<redacted>" in out
+    assert "my secret" not in out and "secret\"" not in out and "secret'" not in out
+
+
+def test_summary_redacts_whole_cookie_header():
+    out = summarize("Bash", {"command": "curl -H 'Cookie: a=b; c=d' http://x"})
+    assert "<redacted>" in out and "a=b" not in out and "c=d" not in out

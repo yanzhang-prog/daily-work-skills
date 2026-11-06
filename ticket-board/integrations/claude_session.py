@@ -1,5 +1,7 @@
 """Wrapper around one Claude Agent SDK session (one board column).
 
+A failed or closed ClaudeSession cannot be restarted: the caller must create a new one.
+
 Why a wrapper: the SDK gives us a message stream and a permission callback. The board wants
 a small, typed event stream plus an approval gate that can wait as long as the human needs.
 All SDK specifics live here so the rest of the app (and the tests) never import the SDK.
@@ -27,14 +29,18 @@ NOT_RUNNING = "session is not running"
 # Only these input keys have their (redacted, truncated) value shown; all others show a size.
 _SAFE_KEYS = {"file_path", "path", "pattern", "url", "title", "name", "query", "team", "project",
               "state", "label", "labels", "assignee", "id", "issue", "command"}
+_VAL = r"""(?:"[^"]*"|'[^']*'|\S+)"""  # a quoted value (spaces allowed) or one bare word
+_KW = r"token|password|passwd|secret|api[_-]?key|apikey|access[_-]?key|credential|auth"
+REDACT_INPUT_MAX = 2000  # cap before regexes run; the summary is ~200 chars anyway
+# Key-ish patterns start only at a word boundary and use bounded {0,40} runs, so matching
+# stays linear on long inputs.
 _REDACTIONS = [  # ordered; each replaces the secret part with <redacted>
-    re.compile(r"(?i)authorization\s*[=:]\s*\S+(\s+\S+)?"),
+    re.compile(rf"(?i)(?<![\w-])authorization\s*[=:]\s*{_VAL}(\s+\S+)?"),
     re.compile(r"(?i)bearer\s+\S+"),
-    re.compile(r"(?i)[\w-]*(token|password|passwd|secret|api[_-]?key|apikey|access[_-]?key|cookie"
-               r"|credential|auth)[\w-]*\s*[=:]\s*\S+"),
-    re.compile(r'(?i)"[\w-]*(token|password|passwd|secret|api[_-]?key|cookie|credential|auth)[\w-]*"'
-               r'\s*:\s*"[^"]*"'),
-    re.compile(r"(?i)--[\w-]*(token|password|passwd|secret|api[_-]?key|key)[\w-]*[ =]\S+"),
+    re.compile(r"(?i)(?<![\w-])(set-)?cookie\s*[=:]\s*[^\n\"']*"),
+    re.compile(rf"(?i)(?<![\w-])[\w-]{{0,40}}({_KW})[\w-]{{0,40}}\s*[=:]\s*{_VAL}"),
+    re.compile(rf'(?i)"[\w-]{{0,40}}({_KW}|cookie)[\w-]{{0,40}}"\s*:\s*"[^"]*"'),
+    re.compile(rf"(?i)--[\w-]{{0,40}}({_KW}|key)[\w-]{{0,40}}[ =]{_VAL}"),
     re.compile(r"(?i)(?<!\S)-u\s+\S+:\S+"),
     re.compile(r"(?i)[?&](token|access_token|api_key|key|sig|signature|secret|password)=[^&\s]+"),
     re.compile(r"://[^/\s:@]+:[^@\s]+@"),
@@ -83,6 +89,7 @@ Event = AssistantText | ToolActivity | PermissionRequest | TurnFinished | Sessio
 
 
 def _redact(text: str) -> str:
+    text = text[:REDACT_INPUT_MAX]
     for rx in _REDACTIONS:
         text = rx.sub("<redacted>", text)
     return text
