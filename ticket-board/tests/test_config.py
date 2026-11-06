@@ -57,3 +57,29 @@ def test_disallowed_includes_pip_variants():
     for t in ("Bash(pip3 install:*)", "Bash(python3 -m pip install:*)",
               "Bash(uv add:*)", "Bash(uv pip install:*)"):
         assert t in config.DISALLOWED_TOOLS
+
+
+def test_data_dir_env_override_moves_all_state(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("TICKET_BOARD_DATA_DIR", str(tmp_path))
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.HANDOFF_DIR == tmp_path / "linear-work"
+        assert reloaded.STATE_FILE == tmp_path / "columns.json"
+        assert reloaded.HISTORY_DIR == tmp_path / "history"
+    finally:
+        monkeypatch.delenv("TICKET_BOARD_DATA_DIR")
+        importlib.reload(config)
+
+
+def test_data_dir_default_is_under_home_claude(monkeypatch):
+    import importlib
+    from pathlib import Path
+    monkeypatch.delenv("TICKET_BOARD_DATA_DIR", raising=False)
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.HANDOFF_DIR == Path.home() / ".claude" / "linear-work"
+        assert reloaded.STATE_FILE == Path.home() / ".claude" / "ticket-board" / "columns.json"
+        assert reloaded.HISTORY_DIR == Path.home() / ".claude" / "ticket-board" / "history"
+    finally:
+        importlib.reload(config)

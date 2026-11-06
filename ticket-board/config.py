@@ -14,10 +14,15 @@ MAX_TEXT_CHARS: int = 20000
 # Test/dev switch: run fake sessions instead of real Claude sessions.
 USE_FAKE_SESSIONS: bool = os.environ.get("TICKET_BOARD_FAKE") == "1"
 
-HANDOFF_DIR: Path = Path.home() / ".claude" / "linear-work"
-STATE_FILE: Path = Path.home() / ".claude" / "ticket-board" / "columns.json"
-
-HISTORY_DIR: Path = Path.home() / ".claude" / "ticket-board" / "history"
+_data_dir = os.environ.get("TICKET_BOARD_DATA_DIR")
+if _data_dir:  # test/dev switch: keep all board state out of ~/.claude
+    HANDOFF_DIR: Path = Path(_data_dir) / "linear-work"
+    STATE_FILE: Path = Path(_data_dir) / "columns.json"
+    HISTORY_DIR: Path = Path(_data_dir) / "history"
+else:
+    HANDOFF_DIR = Path.home() / ".claude" / "linear-work"
+    STATE_FILE = Path.home() / ".claude" / "ticket-board" / "columns.json"
+    HISTORY_DIR = Path.home() / ".claude" / "ticket-board" / "history"
 HANDOFF_POLL_SECONDS: float = 5
 FAKE_SESSION_DELAY_SECONDS: float = 0.3
 
