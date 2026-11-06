@@ -1,0 +1,580 @@
+"""All tests use a fake client with the same async interface as ClaudeSDKClient. No network."""
+import asyncio
+import dataclasses
+from datetime import timezone
+
+import pytest
+from claude_agent_sdk import AssistantMessage, PermissionResultAllow, PermissionResultDeny, ResultMessage, TextBlock, ToolUseBlock
+
+import config
+from integrations.claude_session import (
+    AssistantText, ClaudeSession, PermissionRequest, SessionError, ToolActivity, TurnFinished,
+)
+
+LINEAR_WRITE = "mcp__claude_ai_Linear__save_issue"
+
+
+def result(sid="sid-1"):
+    return ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                         num_turns=1, session_id=sid)
+
+
+class FakeClient:
+    def __init__(self, options, script=None, raises=None, delay=0, connect_raises=None):
+        self.options = options
+        self.delay = delay
+        self.connect_raises = connect_raises
+        self.current = None
+        self.script = script if script is not None else [result()]
+        self.raises = raises
+        self.queries = []
+        self.disconnected = False
+
+    async def connect(self):
+        if self.connect_raises:
+            raise self.connect_raises
+
+    async def query(self, text):
+        self.queries.append(text)
+        self.current = text
+
+    async def receive_response(self):
+        if self.raises:
+            raise self.raises
+        for m in self.script:
+            await asyncio.sleep(self.delay)
+            if isinstance(m, AssistantMessage):  # keep error/session_id fields
+                m = dataclasses.replace(m, content=[TextBlock(f"{self.current}:{b.text}") if isinstance(b, TextBlock) else b for b in m.content])
+            elif isinstance(m, ResultMessage):
+                m = dataclasses.replace(m, session_id=f"sid-{self.current}")
+            yield m
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+def make(**client_kw):
+    holder = {}
+
+    def factory(options):
+        holder["client"] = FakeClient(options, **client_kw)
+        return holder["client"]
+
+    s = ClaudeSession(["virtual-assistant-agent: /x/va (read origin/main)"], client_factory=factory)
+    return s, holder
+
+
+async def started(**kw):
+    s, holder = make(**kw)
+    await s.start()
+    return s, holder["client"]
+
+
+async def next_event(s, timeout=1):
+    return await asyncio.wait_for(anext(s.events()), timeout)
+
+
+async def test_unlisted_tool_waits_for_answer():
+    s, c = await started()
+    task = asyncio.create_task(c.options.can_use_tool("WebFetch", {"url": "http://x"}, None))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    req = await next_event(s)
+    assert isinstance(req, PermissionRequest) and req.tool == "WebFetch"
+    assert req.at.tzinfo == timezone.utc
+    await s.answer_permission(req.request_id, True)
+    assert isinstance(await asyncio.wait_for(task, 1), PermissionResultAllow)
+    await s.close()
+
+
+async def test_deny_is_returned_to_model():
+    s, c = await started()
+    task = asyncio.create_task(c.options.can_use_tool("WebFetch", {}, None))
+    req = await next_event(s)
+    await s.answer_permission(req.request_id, False)
+    res = await asyncio.wait_for(task, 1)
+    assert isinstance(res, PermissionResultDeny) and res.message
+    await s.close()
+
+
+async def test_linear_write_tool_always_asks():
+    assert LINEAR_WRITE not in config.ALLOWED_TOOLS
+    s, c = await started()
+    task = asyncio.create_task(c.options.can_use_tool(LINEAR_WRITE, {"title": "T"}, None))
+    req = await next_event(s)
+    assert req.tool == LINEAR_WRITE
+    assert not task.done()
+    await s.answer_permission(req.request_id, False)
+    assert isinstance(await asyncio.wait_for(task, 1), PermissionResultDeny)
+    await s.close()
+
+
+async def test_allowed_tool_is_allowed_at_once():
+    assert "Read" in config.ALLOWED_TOOLS
+    s, c = await started()
+    res = await asyncio.wait_for(c.options.can_use_tool("Read", {"file_path": "/x"}, None), 1)
+    assert isinstance(res, PermissionResultAllow)
+    await s.close()
+
+
+async def test_unknown_request_id_is_ignored_not_allowed():
+    s, c = await started()
+    task = asyncio.create_task(c.options.can_use_tool("WebFetch", {}, None))
+    req = await next_event(s)
+    await s.answer_permission("no-such-id", True)  # must not raise or release anything
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    await s.answer_permission(req.request_id, False)
+    assert isinstance(await asyncio.wait_for(task, 1), PermissionResultDeny)
+    await s.close()
+
+
+async def test_close_denies_pending_requests():
+    s, c = await started()
+    tasks = [asyncio.create_task(c.options.can_use_tool(t, {}, None)) for t in ("WebFetch", LINEAR_WRITE)]
+    await next_event(s)
+    await next_event(s)
+    await s.close()
+    results = await asyncio.wait_for(asyncio.gather(*tasks), 1)
+    assert len(results) == 2
+    assert all(isinstance(r, PermissionResultDeny) and r.message for r in results)
+    assert c.disconnected
+    late = await c.options.can_use_tool("WebFetch", {}, None)
+    assert isinstance(late, PermissionResultDeny)
+
+
+async def test_turn_finished_carries_session_id():
+    script = [AssistantMessage(content=[TextBlock("hi"), ToolUseBlock("t1", "Read", {"file_path": "/a"})],
+                               model="m"), result()]
+    s, c = await started(script=script)
+    await s.send("hello")
+    evs = [await next_event(s) for _ in range(3)]
+    assert c.queries == ["hello"]
+    assert isinstance(evs[0], AssistantText) and evs[0].text == "hello:hi"
+    assert isinstance(evs[1], ToolActivity) and evs[1].tool == "Read"
+    assert isinstance(evs[2], TurnFinished) and evs[2].session_id == "sid-hello"
+    assert s.session_id == "sid-hello"
+    await s.close()
+
+
+async def test_sdk_exception_becomes_session_error_and_alive_false():
+    s, c = await started(raises=RuntimeError("x" * 500))
+    assert s.alive
+    await s.send("hello")
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError)
+    assert ev.message.startswith("RuntimeError: ") and len(ev.message) == 300
+    assert not s.alive
+    # iterator still terminates on close
+    collected = []
+
+    async def drain():
+        async for e in s.events():
+            collected.append(e)
+
+    t = asyncio.create_task(drain())
+    await asyncio.sleep(0.05)
+    await s.close()
+    await asyncio.wait_for(t, 1)
+
+
+async def test_options_use_disallowed_and_allowed_tools_and_no_bypass():
+    s, c = await started()
+    o = c.options
+    assert config.DISALLOWED_TOOLS and config.ALLOWED_TOOLS
+    assert o.disallowed_tools == config.DISALLOWED_TOOLS
+    from integrations.claude_session import repo_git_rules
+    assert o.allowed_tools == config.ALLOWED_TOOLS + repo_git_rules(config.REPOS)  # no extras given
+    assert o.permission_mode == "default"
+    assert o.model == config.MODEL_NAME
+    assert o.setting_sources == ["user", "project"]
+    assert o.cwd == str(config.SESSION_CWD)
+    assert o.add_dirs
+    assert str(config.SESSION_CWD) not in o.add_dirs
+    assert o.add_dirs == [str(r.path) for r in config.REPOS if r.path != config.SESSION_CWD]
+    await s.close()
+
+
+async def test_system_prompt_contains_repo_lines_and_git_fetch_rule():
+    s, c = await started()
+    sp = c.options.system_prompt
+    assert sp["type"] == "preset" and sp["preset"] == "claude_code"
+    assert "- virtual-assistant-agent: /x/va (read origin/main)" in sp["append"]
+    assert "fetch origin" in sp["append"]
+    await s.close()
+
+
+async def test_resume_passes_session_id_to_options():
+    s, holder = make()
+    await s.start(resume="old-session")
+    assert holder["client"].options.resume == "old-session"
+    await s.close()
+
+
+async def test_permission_summary_is_truncated():
+    s, c = await started()
+    secret = "sk-SECRET-TOKEN"
+    inp = {"title": "t" * 1000, "content": "FULLBODY" * 100, "api_token": secret}
+    task = asyncio.create_task(c.options.can_use_tool(LINEAR_WRITE, inp, None))
+    req = await next_event(s)
+    assert len(req.summary) <= 200
+    assert req.summary.startswith(LINEAR_WRITE)
+    assert "FULLBODY" not in req.summary and secret not in req.summary
+    await s.close()
+    await asyncio.wait_for(task, 1)
+
+
+from integrations.claude_session import summarize
+
+
+async def test_two_quick_sends_are_serialized():
+    script = [AssistantMessage(content=[TextBlock("a")], model="m"),
+              AssistantMessage(content=[TextBlock("b")], model="m"), result()]
+    s, c = await started(script=script, delay=0.02)
+    await s.send("one")
+    await s.send("two")
+    evs = [await next_event(s, 3) for _ in range(6)]
+    kinds = [(type(e).__name__, getattr(e, "text", None) or getattr(e, "session_id", None)) for e in evs]
+    assert kinds == [("AssistantText", "one:a"), ("AssistantText", "one:b"), ("TurnFinished", "sid-one"),
+                     ("AssistantText", "two:a"), ("AssistantText", "two:b"), ("TurnFinished", "sid-two")]
+    assert c.queries == ["one", "two"]
+    await s.close()
+
+
+def test_summary_hides_body_but_shows_size_and_title():
+    out = summarize(LINEAR_WRITE, {"title": "X", "description": "BODYTEXT" * 150, "teamId": "abc"})
+    assert "title=X" in out and "description=1200 chars" in out
+    assert "BODYTEXT" not in out
+
+
+def test_summary_redacts_bearer_token():
+    out = summarize("Bash", {"command": 'curl -H "Authorization: Bearer abc123" http://x'})
+    assert "<redacted>" in out and "abc123" not in out
+
+
+def test_summary_redacts_url_credentials():
+    out = summarize("WebFetch", {"url": "https://user:pw123@host.example/p"})
+    assert "<redacted>" in out and "pw123" not in out
+
+
+def test_summary_nested_values_show_only_count():
+    out = summarize("X", {"labels": ["a", "b"], "payload": {"secret": "hunter2", "k": 1}, "items": [1, 2, 3]})
+    assert "payload=2 items" in out and "items=3 items" in out
+    assert "hunter2" not in out
+
+
+def test_summary_redacts_key_value_secret():
+    out = summarize("Bash", {"command": "export API_KEY=sk-zzz && run"})
+    assert "sk-zzz" not in out and "<redacted>" in out
+
+
+async def test_close_twice_is_safe_and_events_end_empty():
+    s, c = await started()
+    await s.close()
+    await s.close()
+    seen = [e async for e in s.events()]
+    assert seen == []
+    assert s._queue.empty()
+
+
+async def test_send_after_close_emits_session_error():
+    s, c = await started()
+    await s.close()
+    await s.send("hi")
+    assert c.queries == []
+    seen = [e async for e in s.events()]
+    assert len(seen) == 1
+    assert isinstance(seen[0], SessionError) and seen[0].message == "session is not running"
+
+
+async def test_send_after_failure_emits_session_error():
+    s, c = await started(raises=RuntimeError("boom"))
+    await s.send("one")
+    assert isinstance(await next_event(s), SessionError)
+    await s.send("two")
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError) and ev.message == "session is not running"
+    await s.close()
+
+
+async def test_start_failure_emits_error_and_events_end_on_close():
+    s, holder = make(connect_raises=ConnectionError("no cli"))
+    await s.start()
+    assert not s.alive
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError) and "ConnectionError" in ev.message
+    await s.close()
+    assert [e async for e in s.events()] == []
+
+
+@pytest.mark.parametrize("text,secret", [
+    ('curl -H "Authorization: Basic dXNlcjpw" http://x', "dXNlcjpw"),
+    ('curl -H "Authorization: Bearer abc123" http://x', "abc123"),
+    ("tool --token abc123 run", "abc123"),
+    ('curl -d \'{"token": "abc123"}\' http://x', "abc123"),
+    ("AWS_SECRET_ACCESS_KEY=abc123 aws s3 ls", "abc123"),
+    ("curl -u user:pass123 http://x", "pass123"),
+    ("curl https://x.test/a?sig=abc123&x=1", "abc123"),
+    ("echo sk-abcdefgh12345678", "sk-abcdefgh12345678"),
+    ("curl -H 'X-Api-Key: abc123' http://x", "abc123"),
+])
+def test_summary_redacts_secret_forms(text, secret):
+    out = summarize("Bash", {"command": text})
+    assert secret not in out and "<redacted>" in out
+
+
+def test_summary_leaves_harmless_command_alone():
+    assert summarize("Bash", {"command": "git show origin/main:README.md"}) == \
+        "Bash command=git show origin/main:README.md"
+
+
+async def test_failed_turn_reports_dropped_queued_messages():
+    s, c = await started(raises=RuntimeError("boom"))
+    for t in ("one", "two", "three"):
+        await s.send(t)
+    evs = [await next_event(s) for _ in range(3)]
+    assert evs[0].message.startswith("RuntimeError")
+    assert [e.message for e in evs[1:]] == ["message not delivered: session failed"] * 2
+    assert c.queries == ["one"]
+    await s.close()
+
+
+async def test_start_twice_raises():
+    s, c = await started()
+    with pytest.raises(RuntimeError):
+        await s.start()
+    await s.close()
+
+
+async def test_start_after_close_raises():
+    s, holder = make()
+    await s.close()
+    with pytest.raises(RuntimeError):
+        await s.start()
+
+
+@pytest.mark.parametrize("text", ["a" * 40000, "a" * 5000 + "=", "token=" * 500,
+                                  "Authorization: " * 500, "--key " * 800])
+def test_redaction_is_fast_on_long_input(text):
+    import time
+    t0 = time.perf_counter()
+    out = summarize("Bash", {"command": text})
+    assert time.perf_counter() - t0 < 0.2
+    assert len(out) <= 200
+
+
+@pytest.mark.parametrize("text", ['echo password: "my secret" done', "tool --password 'my secret' go",
+                                  'tool --password "my secret" go'])
+def test_summary_redacts_quoted_values_with_spaces(text):
+    out = summarize("Bash", {"command": text})
+    assert "<redacted>" in out
+    assert "my secret" not in out and "secret\"" not in out and "secret'" not in out
+
+
+def test_summary_redacts_whole_cookie_header():
+    out = summarize("Bash", {"command": "curl -H 'Cookie: a=b; c=d' http://x"})
+    assert "<redacted>" in out and "a=b" not in out and "c=d" not in out
+
+
+async def test_start_failure_message_is_redacted():
+    s, _ = make(connect_raises=ConnectionError("no cli token=abc123 api_key=sk-secret9999"))
+    await s.start()
+    ev = await next_event(s)
+    assert "abc123" not in ev.message and "sk-secret9999" not in ev.message
+    assert "ConnectionError" in ev.message and "<redacted>" in ev.message
+
+
+def test_redact_text_public_wrapper_caps_input_and_output():
+    from integrations.claude_session import redact_text
+    assert "abc123" not in redact_text("boom token=abc123")
+    assert len(redact_text("x" * 5000)) == 200
+    assert len(redact_text("y" * 5000, limit=50)) == 50
+
+
+# ---------- final fix wave ----------
+from pathlib import Path
+
+from claude_agent_sdk import SystemMessage
+
+from config import RepoConfig
+
+
+class HangClient(FakeClient):
+    async def connect(self):
+        await asyncio.Event().wait()  # never returns
+
+
+async def test_a1_hung_connect_times_out_into_redacted_session_error(monkeypatch):
+    monkeypatch.setattr(config, "START_TIMEOUT_SECONDS", 0.05)
+    holder = {}
+
+    def factory(o):
+        holder["c"] = HangClient(o)
+        return holder["c"]
+
+    s = ClaudeSession(["x"], client_factory=factory)
+    await asyncio.wait_for(s.start(), 2)  # returns instead of hanging
+    assert not s.alive
+    ev = await next_event(s)
+    assert isinstance(ev, SessionError) and "TimeoutError" in ev.message
+    assert ev.fatal is True
+    await s.close()
+
+
+def test_a1_start_timeout_is_configured():
+    assert config.START_TIMEOUT_SECONDS == 60
+
+
+async def test_a2_assistant_message_error_is_nonfatal_and_turn_still_finishes():
+    script = [AssistantMessage(content=[TextBlock("Invalid API key")], model="m",
+                               error="authentication_failed"), result()]
+    s, c = await started(script=script)
+    await s.send("q")
+    evs = [await next_event(s) for _ in range(3)]
+    assert isinstance(evs[0], AssistantText)
+    assert isinstance(evs[1], SessionError) and evs[1].fatal is False
+    assert "authentication_failed" in evs[1].message
+    assert isinstance(evs[2], TurnFinished) and evs[2].is_error is True
+    assert s.alive  # recoverable: the session keeps running
+    await s.close()
+
+
+async def test_a2_result_is_error_is_nonfatal_session_error():
+    bad = ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=True,
+                        num_turns=1, session_id="x", api_error_status=429)
+    s, c = await started(script=[bad])
+    await s.send("q")
+    e1, e2 = await next_event(s), await next_event(s)
+    assert isinstance(e1, SessionError) and e1.fatal is False and "429" in e1.message
+    assert isinstance(e2, TurnFinished) and e2.is_error is True and e2.session_id == "sid-q"
+    assert s.alive
+    await s.close()
+
+
+async def test_a2_clean_turn_is_not_error():
+    s, c = await started()
+    await s.send("q")
+    ev = await next_event(s)
+    assert isinstance(ev, TurnFinished) and ev.is_error is False
+    await s.close()
+
+
+async def test_b3_session_id_captured_from_init_message_before_turn_ends():
+    from integrations.claude_session import SessionIdKnown
+    script = [SystemMessage("init", {"type": "system", "subtype": "init", "session_id": "early-1"}),
+              AssistantMessage(content=[TextBlock("hi")], model="m"), result()]
+    s, c = await started(script=script, delay=0.01)
+    assert s.session_id is None
+    await s.send("q")
+    first = await next_event(s)
+    assert isinstance(first, SessionIdKnown) and first.session_id == "early-1"
+    assert s.session_id == "early-1"
+    assert isinstance(await next_event(s), AssistantText)
+    await s.close()
+
+
+async def test_b3_session_id_captured_from_assistant_message():
+    from integrations.claude_session import SessionIdKnown
+    script = [AssistantMessage(content=[TextBlock("hi")], model="m", session_id="early-2"), result()]
+    s, c = await started(script=script, delay=0.05)
+    await s.send("q")
+    first = await next_event(s)
+    assert isinstance(first, SessionIdKnown) and first.session_id == "early-2"
+    assert s.session_id == "early-2"
+    await s.close()
+
+
+def test_r21_handoff_write_rule_is_one_exact_absolute_path():
+    from integrations.claude_session import handoff_write_rule
+    p = Path("/Users/yan/.claude/linear-work/2026-11-06-add-search-ab12cd34.md")
+    assert handoff_write_rule(p) == "Edit(//Users/yan/.claude/linear-work/2026-11-06-add-search-ab12cd34.md)"
+    assert "*" not in handoff_write_rule(p)
+
+
+async def test_r21_session_options_get_exactly_the_extra_rule_per_column():
+    from integrations.claude_session import handoff_write_rule, repo_git_rules
+    rules = []
+    for name in ("a-1111.md", "b-2222.md"):
+        rule = handoff_write_rule(Path("/data/linear-work") / name)
+        holder = {}
+
+        def factory(o):
+            holder["c"] = FakeClient(o)
+            return holder["c"]
+
+        s = ClaudeSession(["x"], client_factory=factory, extra_allowed_tools=[rule])
+        await s.start()
+        base = config.ALLOWED_TOOLS + repo_git_rules(config.REPOS)
+        extra = [t for t in holder["c"].options.allowed_tools if t not in base]
+        assert extra == [rule]
+        assert config.ALLOWED_TOOLS.count(rule) == 0  # global list untouched
+        rules.append(rule)
+        await s.close()
+    assert rules[0] != rules[1] and rules[0].endswith("a-1111.md)")
+
+
+def test_r22_repo_git_rules_are_exact_per_repo():
+    from integrations.claude_session import repo_git_rules
+    rules = repo_git_rules([RepoConfig(Path("/a/r1")), RepoConfig(Path("/b/r2"))])
+    want = []
+    for p in ("/a/r1", "/b/r2"):
+        want += [f"Bash(git -C {p} show:*)", f"Bash(git -C {p} grep:*)", f"Bash(git -C {p} log:*)",
+                 f"Bash(git -C {p} rev-parse:*)", f"Bash(git -C {p} fetch)",
+                 f"Bash(git -C {p} fetch origin)",
+                 f"Bash(git -C {p} symbolic-ref --short refs/remotes/origin/HEAD)"]
+    assert rules == want
+
+
+def test_r22_no_rule_allows_writes_or_wildcard_fetch():
+    from integrations.claude_session import repo_git_rules
+    rules = repo_git_rules(config.REPOS)
+    assert len(rules) == 7 * len(config.REPOS)
+    for r in rules + config.ALLOWED_TOOLS:
+        if not r.startswith("Bash("):
+            continue
+        for bad in (" push", " checkout", " pull", " commit", " branch", " reset"):
+            assert bad not in r, r
+        if " fetch" in r or " symbolic-ref" in r:
+            assert "*" not in r, r
+
+
+async def test_r22_session_options_include_repo_git_rules():
+    from integrations.claude_session import repo_git_rules
+    s, c = await started()
+    for rule in repo_git_rules(config.REPOS):
+        assert rule in c.options.allowed_tools
+    await s.close()
+
+
+def test_r23_working_tree_reads_are_labelled():
+    from integrations.claude_session import activity_summary
+    repos = [RepoConfig(Path("/w/skills")), RepoConfig(Path("/w/va"))]
+    kw = dict(repos=repos, cwd=Path("/w/skills"), handoff_dir=Path("/h/linear-work"))
+    assert activity_summary("Read", {"file_path": "/w/va/src/a.py"}, **kw).startswith("working tree: Read ")
+    assert activity_summary("Grep", {"pattern": "x", "path": "/w/va"}, **kw).startswith("working tree: ")
+    assert activity_summary("Glob", {"pattern": "*.py"}, **kw).startswith("working tree: ")  # cwd default
+    assert activity_summary("Read", {"file_path": "src/x.py"}, **kw).startswith("working tree: ")  # relative
+    # not labelled: skills dir, handoff dir, outside repos, other tools
+    for tool, inp in [("Read", {"file_path": "/w/skills/global-skills/linear-workflow/SKILL.md"}),
+                      ("Read", {"file_path": "/h/linear-work/2026-a.md"}),
+                      ("Read", {"file_path": "/tmp/other.txt"}),
+                      ("Read", {"file_path": "/w/vault/x"}),  # prefix-alike, not inside /w/va
+                      ("Bash", {"command": "git -C /w/va show origin/main:a"})]:
+        assert not activity_summary(tool, inp, **kw).startswith("working tree:"), (tool, inp)
+
+
+async def test_r23_session_tool_activity_uses_working_tree_label():
+    repo = config.REPOS[-1].path
+    script = [AssistantMessage(content=[ToolUseBlock("t1", "Read", {"file_path": str(repo / "a.py")})],
+                               model="m"), result()]
+    s, c = await started(script=script)
+    await s.send("q")
+    ev = await next_event(s)
+    assert isinstance(ev, ToolActivity) and ev.summary.startswith("working tree: Read ")
+    await s.close()
+
+
+def test_fake_session_accepts_extra_allowed_tools():
+    from integrations.fake_session import FakeClaudeSession
+    f = FakeClaudeSession(["x"], extra_allowed_tools=["Edit(//a/b.md)"])
+    assert f.extra_allowed_tools == ["Edit(//a/b.md)"]

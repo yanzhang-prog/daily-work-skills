@@ -1,0 +1,106 @@
+:root {
+  --bg: #fff; --fg: #1d1d1f; --muted: #666; --faint: #888;
+  --line: #ccc; --line-soft: #eee; --chat-bg: #fafafa; --bubble: #fff; --bubble-line: #ddd;
+  --user-bg: #e8f0fe; --user-line: #c4d6f8;
+  --working-fg: #2a7; --working-bg: #e3f6ec;
+  --needs-fg: #b36b00; --needs-bg: #fff3dc; --needs-line: #e0a030;
+  --done-fg: #555; --done-bg: #eee;
+  --stuck-fg: #b3261e; --stuck-bg: #fde8e6; --stuck-line: #b3261e;
+  --accent: #1a56db;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181b; --fg: #e8e8ea; --muted: #a0a0a8; --faint: #8a8a92;
+    --line: #3a3b40; --line-soft: #2a2b30; --chat-bg: #1e1f23; --bubble: #26272c; --bubble-line: #3a3b40;
+    --user-bg: #1f2f4d; --user-line: #34507f;
+    --working-fg: #4fd09a; --working-bg: #12301f;
+    --needs-fg: #f0b050; --needs-bg: #3a2c0e; --needs-line: #e0a030;
+    --done-fg: #bbb; --done-bg: #2d2e33;
+    --stuck-fg: #ff8a80; --stuck-bg: #3d1a18; --stuck-line: #d9534f;
+    --accent: #6c9cff;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column; background: var(--bg); color: var(--fg);
+  font: 18px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+button, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.topbar { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.topbar h1 { font-size: 20px; margin: 0; }
+.count { color: var(--muted); }
+.count.hot { color: var(--needs-fg); font-weight: bold; }
+.spacer { flex: 1; }
+.primary { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 6px 16px; }
+.ghost { background: none; border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; }
+
+.board { flex: 1; min-height: 0; display: flex; gap: 12px; padding: 12px; overflow-x: auto; }
+.column {
+  flex: 1 0 380px; min-width: 380px; display: flex; flex-direction: column; min-height: 0;
+  /* constant 3px border: a status change recolours it but never shifts the content */
+  border: 3px solid transparent; box-shadow: 0 0 0 1px var(--line); border-radius: 8px;
+}
+.column.needs_you { border-color: var(--needs-line); box-shadow: none; }
+.column.stuck { border-color: var(--stuck-line); box-shadow: none; }
+
+.col-head { padding: 12px; border-bottom: 1px solid var(--line-soft); }
+.col-title { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; font-size: 20px; font-weight: bold; }
+.col-title span { overflow-wrap: anywhere; }
+.close-btn { background: none; border: 0; font-size: 20px; color: var(--muted); padding: 0 4px; }
+.badge { display: inline-block; border-radius: 14px; padding: 3px 12px; margin: 8px 0; font-size: 18px; }
+.badge.working { background: var(--working-bg); color: var(--working-fg); }
+.badge.needs_you { background: var(--needs-bg); color: var(--needs-fg); }
+.badge.done { background: var(--done-bg); color: var(--done-fg); }
+.badge.stuck { background: var(--stuck-bg); color: var(--stuck-fg); }
+.phases { color: var(--muted); font-size: 15px; }
+.phases .current { font-weight: bold; color: var(--fg); }
+.repos { color: var(--faint); font-size: 14px; margin-top: 4px; overflow-wrap: anywhere; }
+.reconnecting { color: var(--needs-fg); font-size: 14px; margin-top: 4px; }
+.board-conn { color: var(--needs-fg); text-align: center; padding: 8px 16px; }
+.badge.unknown { background: var(--done-bg); color: var(--done-fg); }
+.reconnecting[hidden] { display: none; }
+
+.chat { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; background: var(--chat-bg); display: flex; flex-direction: column; gap: 8px; }
+.msg { max-width: 92%; padding: 10px; border-radius: 8px; border: 1px solid var(--bubble-line); background: var(--bubble);
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user { align-self: flex-end; background: var(--user-bg); border-color: var(--user-line); }
+.msg.assistant { align-self: flex-start; }
+.tool { color: var(--faint); font-size: 16px; overflow-wrap: anywhere; }
+.err { color: var(--stuck-fg); overflow-wrap: anywhere; }
+.err.small { font-size: 18px; }
+.note { align-self: center; text-align: center; color: var(--muted); font-style: italic; font-size: 16px; }
+.perm { border: 2px solid var(--needs-line); background: var(--needs-bg); border-radius: 8px; padding: 10px; }
+.perm .perm-title { font-weight: bold; color: var(--needs-fg); }
+.perm .perm-summary { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
+.perm .row { display: flex; gap: 8px; align-items: center; }
+.perm button { border-radius: 8px; border: 1px solid var(--line); padding: 4px 16px; background: var(--bubble); }
+.perm .allow { background: var(--working-fg); color: #fff; border-color: var(--working-fg); }
+.perm .deny { color: var(--stuck-fg); border-color: var(--stuck-fg); }
+.perm .result { font-weight: bold; }
+.perm .result.muted { font-weight: normal; color: var(--muted); }
+
+.reply { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line-soft); align-items: flex-end; }
+.reply textarea { flex: 1; resize: none; height: 3.4em; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--bg); }
+
+.empty { margin: 48px auto; color: var(--muted); text-align: center; padding: 0 16px; }
+.empty[hidden], [hidden] { display: none !important; }
+
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--fg); width: min(560px, 92vw); padding: 16px; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+dialog h2 { margin: 0 0 12px; font-size: 20px; }
+dialog label { display: block; margin-bottom: 12px; }
+dialog input, dialog textarea { display: block; width: 100%; margin-top: 4px; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--bg); }
+dialog .row { display: flex; justify-content: flex-end; gap: 8px; }
+.form-error { color: var(--stuck-fg); min-height: 1.4em; margin: 0 0 8px; }
+.closed-list { list-style: none; padding: 0; margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
+.closed-list li { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+
+@media (max-width: 700px) {
+  .board { scroll-snap-type: x mandatory; }
+  .column { flex-basis: calc(100vw - 24px); min-width: calc(100vw - 24px); scroll-snap-align: start; }
+  .topbar { flex-wrap: wrap; gap: 8px; }
+}

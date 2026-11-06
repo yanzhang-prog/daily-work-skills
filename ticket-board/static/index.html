@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ticket Board</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Ticket Builder</h1>
+    <span id="open-count" class="count"></span>
+    <span id="needs-count" class="count"></span>
+    <span class="spacer"></span>
+    <button id="closed-btn" type="button" class="ghost" hidden>Closed (0)</button>
+    <button id="new-btn" type="button" class="primary">+ New ticket</button>
+  </header>
+  <div id="board-conn" class="board-conn" role="status">connecting…</div>
+  <main id="board" class="board"></main>
+  <div id="empty" class="empty" hidden>No open tickets yet. Press "+ New ticket" to start one.</div>
+
+  <dialog id="new-dialog">
+    <form id="new-form" method="dialog">
+      <h2>New ticket</h2>
+      <label>Title <input id="new-title" maxlength="120" autocomplete="off"></label>
+      <label>Request <textarea id="new-request" rows="8" maxlength="20000"></textarea></label>
+      <p id="new-error" class="form-error" role="alert"></p>
+      <div class="row">
+        <button type="button" id="new-cancel" class="ghost">Cancel</button>
+        <button type="submit" id="new-submit" class="primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="closed-dialog">
+    <h2>Closed tickets</h2>
+    <ul id="closed-list" class="closed-list"></ul>
+    <div class="row"><button type="button" id="closed-close" class="ghost">Close</button></div>
+  </dialog>
+</body>
+</html>
