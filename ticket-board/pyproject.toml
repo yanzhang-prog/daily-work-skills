@@ -1,7 +1,7 @@
 [project]
 name = "ticket-board"
 version = "0.1.0"
-description = "Add your description here"
+description = "Localhost board that runs several Claude Code Linear ticket-build sessions side by side, one per column."
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.2.178",
