@@ -4,6 +4,10 @@ Run: `uv run python spikes/connector_check.py` (SDK `claude-agent-sdk` 0.2.178+,
 
 ## Verdict: (a) PASS, (b) PASS, (c) PASS, (d) PASS. One safety concern (see end).
 
+**Read-only caveat:** the first run of this spike did NOT have `disallowed_tools`; nothing was written, but only because the prompt asked only for reads. Since fix round 1 the script passes `disallowed_tools` (all write-style Linear/Slack/Notion/Gmail/Calendar/Drive/Claude Docs tools, plus Bash, Write, Edit, NotebookEdit and the pre-allowed Bash patterns) and was re-run; (a)-(d) still hold (total tools 30 -> 27).
+
+**Limit on (b):** Linear and Slack calls were denied by the callback, so only Notion proves the connector authenticates as Yan (it returned real results). Linear and Slack show only "tool exists and was called".
+
 | Q | Result | Evidence |
 |---|--------|----------|
 | (a) sees `linear-workflow` skills | PASS | `init` system message `skills` list: linear-create, linear-decide, linear-draft, linear-investigate, linear-shape, linear-workflow |
@@ -12,7 +16,7 @@ Run: `uv run python spikes/connector_check.py` (SDK `claude-agent-sdk` 0.2.178+,
 | (d) `resume=<session_id>` | PASS | New client with `resume=a6534dd8-...` (same id returned) answered: "Your first request was this: 'List the names of the Linear teams...'". |
 
 ## Real SDK option names (all worked as the plan guessed)
-`ClaudeAgentOptions(setting_sources=["user","project"], cwd=<repo>, can_use_tool=<async fn>, resume=<session_id>)`. Also present: `add_dirs`, `permission_mode`, `allowed_tools`, `disallowed_tools`, `mcp_servers`, `fork_session`, `hooks`, `skills`, `agents`.
+`ClaudeAgentOptions(setting_sources=["user","project"], cwd=<repo>, can_use_tool=<async fn>, resume=<session_id>)`. Used and confirmed working: `setting_sources`, `cwd`, `can_use_tool`, `resume`, `disallowed_tools`. Present in the options dataclass but NOT exercised: `add_dirs`, `permission_mode`, `allowed_tools`, `mcp_servers`, `fork_session`, `hooks`, `skills`, `agents`.
 - `can_use_tool(tool_name, tool_input, context)` is async; return `PermissionResultDeny(message=...)` or `PermissionResultAllow`.
 - Session id comes from `ResultMessage.session_id` (also in the `init` SystemMessage).
 - `ClaudeSDKClient` as async context manager; `query()` then `receive_response()`.

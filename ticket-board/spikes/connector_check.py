@@ -2,7 +2,13 @@
 
 Checks whether a server-started Claude Agent SDK session can see Yan's skills and
 connectors, whether can_use_tool can answer late, and whether resume works.
-READ-ONLY: can_use_tool denies every tool, after a deliberate delay.
+
+What is enforced for read-only-ness (two layers, both needed):
+  1. disallowed_tools (below) hard-blocks the write-style tools by name, including the
+     ones Yan's ~/.claude/settings.json pre-allows (those skip can_use_tool).
+  2. can_use_tool denies every tool that is NOT pre-allowed by settings, after a delay.
+NOT enforced: pre-allowed READ tools (e.g. notion-search) still run for real, and any
+write tool missing from the lists below that is pre-allowed would also run.
 """
 import asyncio
 import time
@@ -32,9 +38,50 @@ async def can_use_tool(name, tool_input, context):
     return PermissionResultDeny(message="Spike is read-only; denied by design.")
 
 
+def _p(prefix, names):
+    return [prefix + n for n in names]
+
+
+DISALLOWED = (
+    ["Bash", "Write", "Edit", "NotebookEdit",
+     "Bash(git add:*)", "Bash(git clone *)", "Bash(pip install:*)", "Bash(pip3 install:*)"]
+    + _p("mcp__claude_ai_Linear__", """create_attachment create_attachment_from_upload create_initiative_label
+        create_issue_label delete_attachment delete_comment delete_customer delete_customer_need
+        delete_diff_comment delete_status_update mark_notification merge_diff prepare_attachment_upload
+        prepare_file_upload resolve_diff_thread restore_initiative_label restore_issue_label
+        restore_project_label retire_initiative_label retire_issue_label retire_project_label
+        save_comment save_customer save_customer_need save_diff_comment save_document save_initiative
+        save_initiative_label save_issue save_issue_label save_milestone save_project save_project_label
+        save_release save_release_note save_status_update share_issue submit_diff_review unshare_issue
+        update_diff""".split())
+    + _p("mcp__claude_ai_Slack__", """slack_add_list_record slack_add_reaction slack_complete_file_upload
+        slack_create_canvas slack_create_conversation slack_create_list slack_get_file_upload_url
+        slack_schedule_message slack_send_message slack_send_message_draft slack_update_canvas
+        slack_update_list slack_update_list_record""".split())
+    + _p("mcp__claude_ai_Notion__", """notion-calendar-cancel-events notion-calendar-create-events
+        notion-calendar-update-events notion-convert-page-to-skill notion-create-attachment
+        notion-create-comment notion-create-database notion-create-file-upload notion-create-folder
+        notion-create-pages notion-create-suggested-edit notion-create-view notion-delete-comment
+        notion-delete-databases notion-delete-pages notion-duplicate-page notion-move-pages
+        notion-resolve-suggested-edit notion-restore-pages notion-send-message-to-session
+        notion-set-comment-reaction notion-set-discussion-resolved notion-spawn-session
+        notion-stop-session notion-update-comment notion-update-data-source notion-update-folder
+        notion-update-page notion-update-view notion-upload-skill""".split())
+    + _p("mcp__claude_ai_Gmail__", """apply_sensitive_message_label apply_sensitive_thread_label create_draft
+        create_label delete_draft delete_label forward label_message label_thread mark_message_spam
+        mark_thread_spam reply send_message trash_message trash_thread unlabel_message unlabel_thread
+        unmark_message_spam unmark_thread_spam untrash_message untrash_thread update_draft update_label
+        update_message_labels""".split())
+    + _p("mcp__claude_ai_Google_Calendar__", "create_event delete_event respond_to_event update_event".split())
+    + _p("mcp__claude_ai_Google_Drive__", "copy_file create_file share_file trash_file update_file".split())
+    + _p("mcp__claude_ai_Claude_Docs__", "batch create delete update".split())
+)
+
+
 def opts(**kw):
     return ClaudeAgentOptions(
-        setting_sources=["user", "project"], cwd=REPO, can_use_tool=can_use_tool, **kw
+        setting_sources=["user", "project"], cwd=REPO, can_use_tool=can_use_tool,
+        disallowed_tools=DISALLOWED, **kw
     )
 
 
