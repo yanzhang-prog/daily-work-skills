@@ -32,6 +32,7 @@ class HandoffSummary:
 
 def _split_sections(text: str) -> dict[str, list[str]]:
     """Map '## Heading' (lowercased) to its body lines. First heading wins."""
+    # Not handled (YAGNI): `## ` lines inside fenced code blocks count as headings.
     sections: dict[str, list[str]] = {}
     current: list[str] | None = None
     for line in text.splitlines():
@@ -46,11 +47,30 @@ def _split_sections(text: str) -> dict[str, list[str]]:
     return sections
 
 
+_BULLET = re.compile(r"^[-*]\s+([^:]+):\s*(.*)$")
+# The template's unfilled choice lines. Matched as literal values (simple and
+# exact) rather than guessing "looks like a list of options": a real value such
+# as `single` or `none` never equals these strings.
+_UNFILLED_CHOICES = {"single | parent | epic | group", "<none | inline | ticket>"}
+
+
+def _is_placeholder(line: str) -> bool:
+    if _PLACEHOLDER.match(line):  # (a) `<...>` line, incl. cut-off `<...`
+        return True
+    m = _BULLET.match(line)
+    if not m:
+        return False
+    value = m.group(2)
+    return (
+        not value  # (b) `- Label:` with nothing after it
+        or bool(_PLACEHOLDER.match(value))  # (c) value is only `<...>`
+        or value in _UNFILLED_CHOICES  # (d) unfilled template choice
+    )
+
+
 def _meaningful(lines: list[str]) -> list[str]:
-    """Body lines minus blanks and template placeholders."""
-    return [
-        s for s in (ln.strip() for ln in lines) if s and not _PLACEHOLDER.match(s)
-    ]
+    """Body lines minus blanks and template scaffold/placeholders."""
+    return [s for s in (ln.strip() for ln in lines) if s and not _is_placeholder(s)]
 
 
 def _normalize_status(raw: str) -> str:
@@ -74,14 +94,20 @@ def _parse_drafts(lines: list[str]) -> tuple[DraftInfo, ...]:
     drafts = []
     for title, body in blocks:
         status_raw, linear_raw = "", ""
+        is_draft = False  # a `### ` block is a draft only with a status/type line
         for ln in body:
-            m = re.match(r"^\s*-\s*(status|linear)\s*:\s*(.*?)\s*$", ln, re.I)
+            m = re.match(r"^\s*-\s*(status|linear|type)\s*:\s*(.*?)\s*$", ln, re.I)
             if not m:
                 continue
-            if m.group(1).lower() == "status" and not status_raw:
+            key = m.group(1).lower()
+            if key in ("status", "type"):
+                is_draft = True
+            if key == "status" and not status_raw:
                 status_raw = m.group(2)
-            elif m.group(1).lower() == "linear" and not linear_raw:
+            elif key == "linear" and not linear_raw:
                 linear_raw = m.group(2)
+        if not is_draft or _PLACEHOLDER.match(title):  # `### <ticket title>` scaffold
+            continue
         linear_id = linear_raw if _LINEAR_ID.match(linear_raw) else None
         drafts.append(DraftInfo(title, _normalize_status(status_raw), linear_id))
     return tuple(drafts)
